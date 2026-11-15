@@ -1,28 +1,29 @@
 #pragma once
 
-// 1. Домашний/рабочий Wi-Fi
+// 1. Ваша сеть Wi-Fi
 #define WIFI_SSID           "EFIR-TV WIFI 751"
 #define WIFI_PASSWORD       "29362271"
 
-// Постоянный статический IP для базы в вашей сети 192.168.0.x
+// Постоянный статический IP в вашей подсети 192.168.0.x
+#define USE_STATIC_IP       true
 #define STATIC_IP_ADDR      192, 168, 0, 200
-#define GATEWAY_IP_ADDR     192, 168, 0, 1      // Адрес вашего роутера
+#define GATEWAY_IP_ADDR     192, 168, 0, 1
 #define SUBNET_MASK         255, 255, 255, 0
-#define DNS_IP_ADDR         192, 168, 0, 1
+#define DNS_IP_ADDR         8, 8, 8, 8
 
-// 2. Резервная точка доступа на самой ESP32-S3 (поднимается, если нет связи с роутером)
+// 2. Резервная точка доступа (если роутер выключен)
 #define AP_SSID             "wifi-iot"
-#define AP_PASSWORD         "12345678"      // Минимум 8 символов!
+#define AP_PASSWORD         "12345678"
 
-// 3. Имя в локальной сети и пароль OTA / веб-обновления
+// 3. Имя устройства и пароль для прошивки по воздуху (OTA)
 #define OTA_HOSTNAME        "rtk-base"
 #define OTA_PASSWORD        "admin1234"
 
-// 4. Встроенный прямой NTRIP-сервер (Порт 2101)
+// 4. Встроенный прямой NTRIP-сервер на ESP32-S3 (Порт 2101)
 #define LOCAL_NTRIP_PORT    2101
 #define LOCAL_MOUNTPOINT    "PINSK_BASE"
 
-// 5. Облачный кастер Emlid (по умолчанию выключен, включается в веб-панели)
+// 5. Облачный кастер Emlid
 #define ENABLE_CLOUD_CASTER false
 #define CASTER_HOST         "caster.emlid.com"
 #define CASTER_PORT         2101
