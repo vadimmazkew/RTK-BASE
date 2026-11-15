@@ -1,7 +1,8 @@
 #pragma once
 
-// 1. Ваша сеть Wi-Fi
-#define WIFI_SSID           "EFIR-TV WIFI 751"
+// 1. Основная сеть 2.4 ГГц и резервная сеть вашего роутера
+#define WIFI_SSID           "EFIR-TV WIFI 751_24"
+#define WIFI_SSID_ALT       "EFIR-TV WIFI 751"
 #define WIFI_PASSWORD       "29362271"
 
 // Постоянный статический IP в вашей подсети 192.168.0.x
@@ -11,7 +12,7 @@
 #define SUBNET_MASK         255, 255, 255, 0
 #define DNS_IP_ADDR         8, 8, 8, 8
 
-// 2. Резервная точка доступа (если роутер выключен)
+// 2. Постоянная точка доступа на самой плате (работает ВСЕГДА!)
 #define AP_SSID             "wifi-iot"
 #define AP_PASSWORD         "12345678"
 
