@@ -221,19 +221,7 @@ void processUARTStream() {
 
 // 5. Подключение к EFIR-TV WIFI 751 (192.168.0.200) + резервная точка wifi-iot (192.168.4.1)
 void startFallbackAP() {
-  isApMode = true;
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_AP);
-
-  IPAddress local_IP(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.softAPConfig(local_IP, gateway, subnet);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-  Serial.println("\n[Wi-Fi AP] Роутер не найден. Поднята резервная точка доступа!");
-  Serial.printf("[Wi-Fi AP] Сеть: %s | Пароль: %s | Панель: http://192.168.4.1\n", AP_SSID, AP_PASSWORD);
+  // Оставляем пустой для совместимости, так как AP теперь включена всегда
 }
 
 void initNetwork() {
@@ -241,26 +229,28 @@ void initNetwork() {
   WiFi.disconnect(true);
   delay(100);
 
+  // Включаем ДВОЙНОЙ режим: и точка доступа wifi-iot, и подключение к домашнему роутеру одновременно!
+  WiFi.mode(WIFI_AP_STA);
+
+  // 1. Сразу на первой секунде поднимаем точку доступа wifi-iot (192.168.4.1)
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress apNet(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apIP, apNet);
+  WiFi.softAP("wifi-iot", "12345678", 1, 0, 4); // Канал 1, открытая видимость (SSID не скрыт)
+  Serial.println("\n[Wi-Fi AP] Точка 'wifi-iot' (пароль 12345678) ЗАПУЩЕНА! Адрес: http://192.168.4.1");
+
+  // 2. Параллельно подключаемся к вашему роутеру EFIR-TV WIFI 751 (по DHCP, без конфликтов IP)
   if (wifiSsid.length() > 0) {
-    Serial.printf("\n[Wi-Fi] Подключение к сети '%s'", wifiSsid.c_str());
-    WiFi.mode(WIFI_STA);
+    Serial.printf("[Wi-Fi STA] Подключение к роутеру '%s'", wifiSsid.c_str());
     WiFi.setHostname(OTA_HOSTNAME);
-
-    #if USE_STATIC_IP
-    IPAddress staticIP(STATIC_IP_ADDR);
-    IPAddress gateway(GATEWAY_IP_ADDR);
-    IPAddress subnet(SUBNET_MASK);
-    IPAddress dns(DNS_IP_ADDR);
-    if (!WiFi.config(staticIP, gateway, subnet, dns)) {
-      Serial.println("\n[ОШИБКА] Не удалось применить статический IP!");
-    }
-    #endif
-
     WiFi.setAutoReconnect(true);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
 
+    // Снижаем пиковую мощность передатчика до 15 dBm (защита от просадки питания USB кабеля)
+    WiFi.setTxPower(WIFI_POWER_15dBm);
+
     uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) { // Ждем 15 секунд
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
       delay(500);
       Serial.print(".");
       attempts++;
@@ -269,10 +259,11 @@ void initNetwork() {
 
   if (WiFi.status() == WL_CONNECTED) {
     isApMode = false;
-    Serial.printf("\n[OK] Wi-Fi подключен! Постоянный адрес базы: http://%s\n",
+    Serial.printf("\n[OK] Подключено к роутеру! IP в домашней сети: http://%s\n",
                   WiFi.localIP().toString().c_str());
   } else {
-    startFallbackAP();
+    isApMode = true;
+    Serial.println("\n[ИНФО] Роутер пока не ответил, работаем через точку 'wifi-iot' (http://192.168.4.1)");
   }
 
   MDNS.begin(OTA_HOSTNAME);
@@ -281,7 +272,6 @@ void initNetwork() {
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.begin();
 }
-
 // 6. Веб-панель управления (Порт 80)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
