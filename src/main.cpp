@@ -239,6 +239,14 @@ void initNetwork() {
   if (hasValidCreds) {
     Serial.printf("\n[Wi-Fi] Подключение к роутеру %s", wifiSsid.c_str());
     WiFi.mode(WIFI_STA);
+
+    // Фиксируем постоянный IP 192.168.0.200 в вашей домашней сети
+    IPAddress staticIP(STATIC_IP_ADDR);
+    IPAddress gateway(GATEWAY_IP_ADDR);
+    IPAddress subnet(SUBNET_MASK);
+    IPAddress dns(DNS_IP_ADDR);
+    WiFi.config(staticIP, gateway, subnet, dns);
+
     WiFi.setAutoReconnect(true);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
 
@@ -252,10 +260,10 @@ void initNetwork() {
 
   if (WiFi.status() == WL_CONNECTED) {
     isApMode = false;
-    Serial.printf("\n[OK] Подключено к роутеру! IP: http://%s (или http://%s.local)\n",
-                  WiFi.localIP().toString().c_str(), OTA_HOSTNAME);
+    Serial.printf("\n[OK] Подключено к роутеру! Постоянный IP: http://%s\n",
+                  WiFi.localIP().toString().c_str());
   } else {
-    startFallbackAP();
+    startFallbackAP(); // Если роутера нет рядом — поднимает wifi-iot (192.168.4.1)
   }
 
   MDNS.begin(OTA_HOSTNAME);
