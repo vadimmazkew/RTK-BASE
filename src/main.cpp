@@ -196,7 +196,7 @@ void onSVINData(UBX_NAV_SVIN_data_t *svin) {
 void onSATData(UBX_NAV_SAT_data_t *sat) {
   if (sat == nullptr) return;
 
-  uint8_t total = sat->header.numSVs;
+  uint8_t total = sat->header.numSvs; // ИСПРАВЛЕНО: маленькая буква 'v' для SparkFun v3.1.15
   uint8_t count = 0;
   uint8_t usedCount = 0;
   uint32_t snrSum = 0;
@@ -207,7 +207,6 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
     uint8_t cno    = sat->blocks[i].cno;
     bool isUsed    = (sat->blocks[i].flags.bits.svUsed == 1);
 
-    // Фильтруем только спутники с реальным сигналом (>0 dBHz) или в слежении
     if (cno == 0) continue;
 
     char sChar = 'G';
@@ -231,7 +230,7 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
     }
   }
 
-  // Сортируем спутники: сначала используемые и с лучшим сигналом
+  // Сортируем спутники по убыванию уровня сигнала (SNR)
   for (uint8_t i = 0; i < count; i++) {
     for (uint8_t j = i + 1; j < count; j++) {
       if (satList[j].cno > satList[i].cno) {
@@ -384,7 +383,6 @@ void setupWebMonitor() {
     json += "\"bytes\":" + String(last5SecBytes) + ",";
     json += "\"net\":\"" + netInfo + "\",";
 
-    // Массив спутников для отрисовки столбиков SNR
     json += "\"sats\":[";
     uint8_t outCount = 0;
     for (uint8_t i = 0; i < MAX_DISPLAY_SATS && i < satsInView; i++) {
@@ -394,7 +392,7 @@ void setupWebMonitor() {
       json += "\"cno\":" + String(satList[i].cno) + ",";
       json += "\"used\":" + String(satList[i].used ? 1 : 0) + "}";
       outCount++;
-      if (outCount >= 28) break; // Показываем топ-28 спутников на экране
+      if (outCount >= 28) break;
     }
     json += "]}";
     webServer.send(200, "application/json", json);
