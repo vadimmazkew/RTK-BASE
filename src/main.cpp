@@ -8,7 +8,7 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.3.2"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
@@ -23,7 +23,7 @@ WiFiClient localRoverClients[MAX_LOCAL_CLIENTS];
 WebServer webServer(80);
 HTTPUpdateServer httpUpdater;
 
-// === Настройки в энергонезависимой памяти NVS ===
+// === Настройки (по умолчанию сразу берем EFIR-TV WIFI 751) ===
 String wifiSsid     = WIFI_SSID;
 String wifiPass     = WIFI_PASSWORD;
 bool cloudEnabled   = ENABLE_CLOUD_CASTER;
@@ -54,9 +54,9 @@ uint32_t svinObsTime = 0;
 float svinMeanAcc = 0.0;
 bool f9pConnected = false;
 
-// 1. Загрузка и сохранение всех параметров в NVS
+// 1. Загрузка и сохранение настроек в NVS (новый раздел rtk-v2, чтобы сбросить старые заглушки)
 void loadSettings() {
-  prefs.begin("rtk-cfg", true);
+  prefs.begin("rtk-v2", true);
   wifiSsid      = prefs.getString("w_ssid", WIFI_SSID);
   wifiPass      = prefs.getString("w_pass", WIFI_PASSWORD);
   cloudEnabled  = prefs.getBool("c_en", ENABLE_CLOUD_CASTER);
@@ -72,10 +72,16 @@ void loadSettings() {
   svinMinDur    = prefs.getUInt("dur", 300);
   svinAccLimitM = prefs.getFloat("acc", 2.00f);
   prefs.end();
+
+  // Защита: если в NVS случайно осталась заглушка, принудительно ставим ваш Wi-Fi
+  if (wifiSsid == "YOUR_WIFI_SSID" || wifiSsid.length() == 0) {
+    wifiSsid = WIFI_SSID;
+    wifiPass = WIFI_PASSWORD;
+  }
 }
 
 void saveSettings() {
-  prefs.begin("rtk-cfg", false);
+  prefs.begin("rtk-v2", false);
   prefs.putString("w_ssid", wifiSsid);
   prefs.putString("w_pass", wifiPass);
   prefs.putBool("c_en", cloudEnabled);
@@ -115,7 +121,7 @@ void broadcastRTCM(const uint8_t *data, size_t len) {
   }
 }
 
-// 2. Применение режима координат (TMODE3) в ZED-F9P с точностью 0.1 мм
+// 2. Применение режима координат (TMODE3) в ZED-F9P
 bool applyBaseModeToF9P() {
   if (!f9pConnected) return false;
 
@@ -170,7 +176,7 @@ void onSVINData(UBX_NAV_SVIN_data_t *svin) {
   svinMeanAcc = svin->meanAcc / 10000.0f;
 }
 
-// 4. Двухпоточный демультиплексор UART2 (разделяет RTCM3 и UBX для телеметрии)
+// 4. Двухпоточный демультиплексор UART2 (RTCM3 + UBX)
 void processUARTStream() {
   static uint8_t rtcmBuf[1030];
   static uint16_t rtcmIdx = 0;
@@ -186,14 +192,12 @@ void processUARTStream() {
         rtcmIdx = 0;
         rtcmBuf[rtcmIdx++] = b;
       } else {
-        // Все не-RTCM байты (пакеты UBX-NAV-PVT и UBX-NAV-SVIN) отдаем в парсер SparkFun
         myGNSS.pushRawData(&b, 1);
       }
     } else {
       rtcmBuf[rtcmIdx++] = b;
       if (rtcmIdx == 3) {
         if ((rtcmBuf[1] & 0xFC) != 0x00) {
-          // Оказался не RTCM — возвращаем накопленные 3 байта в UBX-парсер
           myGNSS.pushRawData(rtcmBuf, 3);
           inRtcmFrame = false;
           rtcmIdx = 0;
@@ -215,43 +219,48 @@ void processUARTStream() {
   myGNSS.checkCallbacks();
 }
 
-// 5. Настройка Wi-Fi с автоматическим откатом в точку доступа "wifi-iot" (192.168.4.1)
+// 5. Подключение к EFIR-TV WIFI 751 (192.168.0.200) + резервная точка wifi-iot (192.168.4.1)
 void startFallbackAP() {
   isApMode = true;
   WiFi.disconnect(true);
   delay(100);
   WiFi.mode(WIFI_AP);
 
-  // Жестко фиксируем IP 192.168.4.1 для точки доступа wifi-iot
   IPAddress local_IP(192, 168, 4, 1);
   IPAddress gateway(192, 168, 4, 1);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.softAPConfig(local_IP, gateway, subnet);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
 
-  Serial.println("\n[Wi-Fi AP] Поднята собственная точка доступа!");
-  Serial.printf("[Wi-Fi AP] Сеть: %s | Пароль: %s | Адрес: http://192.168.4.1\n", AP_SSID, AP_PASSWORD);
+  Serial.println("\n[Wi-Fi AP] Роутер не найден. Поднята резервная точка доступа!");
+  Serial.printf("[Wi-Fi AP] Сеть: %s | Пароль: %s | Панель: http://192.168.4.1\n", AP_SSID, AP_PASSWORD);
 }
 
 void initNetwork() {
-  bool hasValidCreds = (wifiSsid.length() > 0 && wifiSsid != "YOUR_WIFI_SSID");
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(100);
 
-  if (hasValidCreds) {
-    Serial.printf("\n[Wi-Fi] Подключение к роутеру %s", wifiSsid.c_str());
+  if (wifiSsid.length() > 0) {
+    Serial.printf("\n[Wi-Fi] Подключение к сети '%s'", wifiSsid.c_str());
     WiFi.mode(WIFI_STA);
+    WiFi.setHostname(OTA_HOSTNAME);
 
-    // Фиксируем постоянный IP 192.168.0.200 в вашей домашней сети
+    #if USE_STATIC_IP
     IPAddress staticIP(STATIC_IP_ADDR);
     IPAddress gateway(GATEWAY_IP_ADDR);
     IPAddress subnet(SUBNET_MASK);
     IPAddress dns(DNS_IP_ADDR);
-    WiFi.config(staticIP, gateway, subnet, dns);
+    if (!WiFi.config(staticIP, gateway, subnet, dns)) {
+      Serial.println("\n[ОШИБКА] Не удалось применить статический IP!");
+    }
+    #endif
 
     WiFi.setAutoReconnect(true);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
 
     uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 24) { // Ждем 12 секунд
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) { // Ждем 15 секунд
       delay(500);
       Serial.print(".");
       attempts++;
@@ -260,10 +269,10 @@ void initNetwork() {
 
   if (WiFi.status() == WL_CONNECTED) {
     isApMode = false;
-    Serial.printf("\n[OK] Подключено к роутеру! Постоянный IP: http://%s\n",
+    Serial.printf("\n[OK] Wi-Fi подключен! Постоянный адрес базы: http://%s\n",
                   WiFi.localIP().toString().c_str());
   } else {
-    startFallbackAP(); // Если роутера нет рядом — поднимает wifi-iot (192.168.4.1)
+    startFallbackAP();
   }
 
   MDNS.begin(OTA_HOSTNAME);
@@ -273,18 +282,17 @@ void initNetwork() {
   ArduinoOTA.begin();
 }
 
-// 6. Веб-панель управления с живым обновлением JSON и настройкой Wi-Fi
+// 6. Веб-панель управления (Порт 80)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
-  // API для живого обновления данных без перезагрузки страницы
   webServer.on("/api/status", HTTP_GET, []() {
     String fixText = !f9pConnected ? "Ожидание ZED-F9P (UART)" :
                      (currentFixType == 5) ? "TIME (БАЗА АКТИВНА)" :
                      (currentFixType == 3) ? "3D FIX (Усреднение)" : "Поиск спутников";
     String svinText = svinValid ? "ГОТОВО" : (svinActive ? "Накопление..." : "Выкл / Fixed");
     String netInfo = isApMode ? ("Точка доступа: " + String(AP_SSID) + " (192.168.4.1)") :
-                                ("Роутер: " + wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
+                                (wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
     String json = "{";
     json += "\"f9p\":" + String(f9pConnected ? "true" : "false") + ",";
@@ -337,7 +345,6 @@ void setupWebMonitor() {
       "}, 2000);"
       "</script></head><body>"
 
-      // Карточка 1: Живая телеметрия
       "<div class='card'>"
       "<h2>📡 RTK База (" + String(LOCAL_MOUNTPOINT) + ") <small style='font-size:12px;color:#888;'>v" FW_VERSION "</small></h2>"
       "<div class='row'><span>Приемник:</span><b id='s_fix'>Загрузка...</b></div>"
@@ -347,10 +354,9 @@ void setupWebMonitor() {
       "<div class='row'><span>Текущие WGS-84:</span><b id='s_coords'>-</b></div>"
       "<div class='row'><span>Роверов (Порт " + String(LOCAL_NTRIP_PORT) + "):</span><b id='s_rovers'>0 шт.</b></div>"
       "<div class='row'><span>Поток RTCM3 (5с):</span><b id='s_bytes'>0 байт</b></div>"
-      "<div class='row'><span>Сеть:</span><b id='s_net' style='font-size:12px;'>-</b></div>"
+      "<div class='row'><span>Сеть:</span><b id='s_net' style='font-size:12px;'>" + WiFi.localIP().toString() + "</b></div>"
       "</div>"
 
-      // Карточка 2: Координаты и режим базы
       "<div class='card'>"
       "<h3>⚙️ Координаты и режим базы</h3>"
       "<div style='display:flex;justify-content:space-between;'>"
@@ -381,17 +387,16 @@ void setupWebMonitor() {
       "</form>"
       "</div>"
 
-      // Карточка 3: Настройки Wi-Fi и облака (с перезагрузкой)
       "<div class='card'>"
       "<h3>🌐 Сеть Wi-Fi и Кастер</h3>"
       "<form action='/save_net' method='POST'>"
-      "<label>Имя домашнего/рабочего Wi-Fi (SSID):</label>"
-      "<input type='text' name='w_ssid' value='" + wifiSsid + "' placeholder='Оставьте пустым для работы через wifi-iot'>"
+      "<label>Имя Wi-Fi сети (SSID):</label>"
+      "<input type='text' name='w_ssid' value='" + wifiSsid + "'>"
       "<label>Пароль Wi-Fi:</label>"
       "<input type='password' name='w_pass' value='" + wifiPass + "'>"
       "<label>Дублировать поток во внешний NTRIP Caster:</label>"
       "<select name='c_en'>"
-      "<option value='0'" + String(!cloudEnabled ? " selected" : "") + ">Выкл (Только прямой сервер на ESP32)</option>"
+      "<option value='0'" + String(!cloudEnabled ? " selected" : "") + ">Выкл (Только прямой сервер 192.168.0.200:2101)</option>"
       "<option value='1'" + String(cloudEnabled ? " selected" : "") + ">Вкл (Отправлять на Emlid / свой сервер)</option>"
       "</select>"
       "<label>Хост / Порт кастера:</label>"
@@ -449,7 +454,7 @@ void setupWebMonitor() {
     if (webServer.hasArg("c_pass")) casterPass   = webServer.arg("c_pass");
 
     saveSettings();
-    webServer.send(200, "text/html", "<meta charset='utf-8'><h3>Настройки сохранены! Перезагрузка платы...</h3>");
+    webServer.send(200, "text/html", "<meta charset='utf-8'><h3>Настройки сохранены! Перезагрузка...</h3>");
     delay(800);
     ESP.restart();
   });
@@ -576,11 +581,15 @@ bool connectCloudCaster() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1500);
+  delay(1000);
   loadSettings();
-  configureF9PBase();
+
+  // Сначала поднимаем Wi-Fi и веб-сервер (чтобы плата сразу появилась в сети за 3 секунды)
   initNetwork();
   setupWebMonitor();
+
+  // Затем ищем ZED-F9P
+  configureF9PBase();
 }
 
 void loop() {
