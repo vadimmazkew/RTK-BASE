@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
@@ -229,17 +230,19 @@ void initNetwork() {
   WiFi.disconnect(true);
   delay(100);
 
-  // Включаем одновременный режим: точка wifi-iot (192.168.4.1) + клиент роутера (192.168.0.200)
   WiFi.mode(WIFI_AP_STA);
 
-  // 1. Мгновенно запускаем точку доступа wifi-iot (будет видна в списке Wi-Fi всегда!)
-  IPAddress apIP(192, 168, 4, 1);
-  IPAddress apNet(255, 255, 255, 0);
-  WiFi.softAPConfig(apIP, apIP, apNet);
-  WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 4);
-  Serial.println("\n[Wi-Fi AP] Точка 'wifi-iot' (192.168.4.1) ЗАПУЩЕНА!");
+  // 1. КРИТИЧНО: Разблокируем 13-й канал Wi-Fi (2472 МГц) для Беларуси/Европы!
+  wifi_country_t country = {
+    .cc = "BY",
+    .schan = 1,
+    .nchan = 13,
+    .max_tx_power = 20,
+    .policy = WIFI_COUNTRY_POLICY_MANUAL
+  };
+  esp_wifi_set_country(&country);
 
-  // 2. Настраиваем статический IP 192.168.0.200 для домашнего роутера
+  // 2. Настраиваем статический IP 192.168.0.200
   #if USE_STATIC_IP
   IPAddress staticIP(STATIC_IP_ADDR);
   IPAddress gateway(GATEWAY_IP_ADDR);
@@ -248,36 +251,41 @@ void initNetwork() {
   WiFi.config(staticIP, gateway, subnet, dns);
   #endif
 
-  // 3. Пробуем подключиться к EFIR-TV WIFI 751_24 (2.4 ГГц)
-  Serial.printf("[Wi-Fi STA] Пробуем сеть '%s'", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  uint8_t attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 16) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
+  // 3. Сначала подключаемся к домашнему роутеру (проверяем сеть из веб-панели и обе ваши сети на 2472 МГц)
+  const char* netsToTry[] = { wifiSsid.c_str(), "EFIR-TV WIFI 751", "EFIR TV WIFI 751_24" };
 
-  // 4. Если не подключилось — пробуем вторую сеть EFIR-TV WIFI 751
-  #ifdef WIFI_SSID_ALT
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("\n[Wi-Fi STA] Пробуем вторую сеть '%s'", WIFI_SSID_ALT);
-    WiFi.begin(WIFI_SSID_ALT, WIFI_PASSWORD);
-    attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 16) {
+  for (int i = 0; i < 3; i++) {
+    if (strlen(netsToTry[i]) == 0) continue;
+    Serial.printf("\n[Wi-Fi STA] Подключение к '%s' (Каналы 1-13)...", netsToTry[i]);
+    WiFi.begin(netsToTry[i], wifiPass.c_str());
+
+    uint8_t attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 16) { // Ждем 8 секунд
       delay(500);
       Serial.print(".");
       attempts++;
     }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSsid = netsToTry[i];
+      break;
+    }
   }
-  #endif
+
+  // 4. Определяем канал роутера (у вас это 13-й канал) и запускаем wifi-iot на том же канале!
+  int activeChannel = (WiFi.status() == WL_CONNECTED) ? WiFi.channel() : 1;
+
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress apNet(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apIP, apNet);
+  WiFi.softAP(AP_SSID, AP_PASSWORD, activeChannel, 0, 4);
 
   if (WiFi.status() == WL_CONNECTED) {
     isApMode = false;
-    Serial.printf("\n[OK] Подключено к роутеру! Адрес: http://%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("\n[OK] Подключено к '%s' на канале %d! Адрес: http://%s\n",
+                  wifiSsid.c_str(), activeChannel, WiFi.localIP().toString().c_str());
   } else {
     isApMode = true;
-    Serial.println("\n[ИНФО] Работаем через точку доступа wifi-iot -> http://192.168.4.1");
+    Serial.println("\n[ИНФО] Роутер не ответил, работаем через wifi-iot (http://192.168.4.1)");
   }
 
   MDNS.begin(OTA_HOSTNAME);
