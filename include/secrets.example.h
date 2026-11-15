@@ -1,8 +1,14 @@
 #pragma once
 
-// 1. Домашний/рабочий Wi-Fi (по умолчанию, можно поменять позже прямо в веб-панели)
+// 1. Домашний/рабочий Wi-Fi
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
+
+// Постоянный статический IP для базы в вашей сети 192.168.0.x
+#define STATIC_IP_ADDR      192, 168, 0, 200
+#define GATEWAY_IP_ADDR     192, 168, 0, 1      // Адрес вашего роутера
+#define SUBNET_MASK         255, 255, 255, 0
+#define DNS_IP_ADDR         192, 168, 0, 1
 
 // 2. Резервная точка доступа на самой ESP32-S3 (поднимается, если нет связи с роутером)
 #define AP_SSID             "wifi-iot"
