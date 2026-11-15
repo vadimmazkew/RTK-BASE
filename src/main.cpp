@@ -8,7 +8,7 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.2.1"
 #define RXD2 16  // Подключить к TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // Подключить к RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
@@ -21,7 +21,7 @@ WiFiClient cloudCasterClient;
 WiFiServer localNtripServer(LOCAL_NTRIP_PORT);
 WiFiClient localRoverClients[MAX_LOCAL_CLIENTS];
 WebServer webServer(80);
-HTTPUpdateServer httpUpdater; // Веб-прошивка через браузер (/update)
+HTTPUpdateServer httpUpdater;
 
 // === Настройки режима базы (хранятся в энергонезависимой памяти NVS) ===
 bool useFixedBase = false;
@@ -76,6 +76,21 @@ uint8_t getActiveRoverCount() {
   return count;
 }
 
+// Отправка отфильтрованного пакета RTCM3 всем роверам и в облако
+void broadcastRTCM(const uint8_t *data, size_t len) {
+  if (len == 0) return;
+  rtcmBytesGenerated += len;
+
+  for (int i = 0; i < MAX_LOCAL_CLIENTS; i++) {
+    if (localRoverClients[i] && localRoverClients[i].connected()) {
+      localRoverClients[i].write(data, len);
+    }
+  }
+  if (ENABLE_CLOUD_CASTER && cloudCasterClient.connected()) {
+    cloudCasterClient.write(data, len);
+  }
+}
+
 // 2. Передача координат и режима TMODE3 в ZED-F9P с точностью 0.1 мм (High Precision)
 bool applyBaseModeToF9P() {
   if (!f9pConnected) return false;
@@ -113,22 +128,9 @@ bool applyBaseModeToF9P() {
   return myGNSS.sendCfgValset();
 }
 
-// 3. Колбэки обработки потоков ZED-F9P
-void onRTCMData(UBX_RTCM_data_t *rtcmData) {
-  if (rtcmData == nullptr || rtcmData->length == 0) return;
-  rtcmBytesGenerated += rtcmData->length;
-
-  for (int i = 0; i < MAX_LOCAL_CLIENTS; i++) {
-    if (localRoverClients[i] && localRoverClients[i].connected()) {
-      localRoverClients[i].write(rtcmData->data, rtcmData->length);
-    }
-  }
-  if (ENABLE_CLOUD_CASTER && cloudCasterClient.connected()) {
-    cloudCasterClient.write(rtcmData->data, rtcmData->length);
-  }
-}
-
+// 3. Колбэки телеметрии SparkFun v3 (UBX-NAV-PVT и UBX-NAV-SVIN)
 void onPVTData(UBX_NAV_PVT_data_t *pvt) {
+  if (pvt == nullptr) return;
   currentSIV = pvt->numSV;
   currentFixType = pvt->fixType;
   liveLatDeg = pvt->lat / 1e7;
@@ -137,13 +139,60 @@ void onPVTData(UBX_NAV_PVT_data_t *pvt) {
 }
 
 void onSVINData(UBX_NAV_SVIN_data_t *svin) {
+  if (svin == nullptr) return;
   svinActive = (svin->active == 1);
   svinValid = (svin->valid == 1);
   svinObsTime = svin->dur;
   svinMeanAcc = svin->meanAcc / 10000.0f;
 }
 
-// 4. Веб-интерфейс управления + Веб-OTA (/update)
+// 4. Опрос ZED-F9P и пересылка потока RTCM3
+// Чтобы не блокировать библиотеку SparkFun v3, мы переопределяем метод чтения или
+// используем встроенный колбэк pushRawData / чтение через буфер.
+// Самый надежный способ в v3.1.15: опрашиваем телеметрию раз в 2 секунды, а все
+// остальное время пересылаем бинарный поток напрямую из UART2 с фильтрацией кадров RTCM3 (0xD3).
+void processUARTStream() {
+  static uint8_t rtcmBuf[1030];
+  static uint16_t rtcmIdx = 0;
+  static uint16_t rtcmExpectedLen = 0;
+  static bool inRtcmFrame = false;
+
+  while (RTKSerial.available() > 0) {
+    uint8_t b = RTKSerial.read();
+
+    if (!inRtcmFrame) {
+      if (b == 0xD3) { // Стандартный заголовок пакета RTCM 3.x
+        inRtcmFrame = true;
+        rtcmIdx = 0;
+        rtcmBuf[rtcmIdx++] = b;
+      }
+    } else {
+      rtcmBuf[rtcmIdx++] = b;
+
+      if (rtcmIdx == 3) {
+        // Байты 1 и 2 содержат 10-битную длину полезной нагрузки (первые 6 бит должны быть 0)
+        if ((rtcmBuf[1] & 0xFC) != 0x00) {
+          inRtcmFrame = false; // Ложное совпадение 0xD3
+          rtcmIdx = 0;
+        } else {
+          uint16_t payloadLen = ((uint16_t)(rtcmBuf[1] & 0x03) << 8) | rtcmBuf[2];
+          rtcmExpectedLen = payloadLen + 6; // 3 байта заголовка + payload + 3 байта CRC24Q
+          if (rtcmExpectedLen > sizeof(rtcmBuf)) {
+            inRtcmFrame = false;
+            rtcmIdx = 0;
+          }
+        }
+      } else if (rtcmIdx >= 3 && rtcmIdx == rtcmExpectedLen) {
+        // Полный пакет RTCM3 собран — мгновенно отправляем роверам!
+        broadcastRTCM(rtcmBuf, rtcmExpectedLen);
+        inRtcmFrame = false;
+        rtcmIdx = 0;
+      }
+    }
+  }
+}
+
+// 5. Веб-интерфейс управления + Веб-OTA (/update)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
@@ -255,11 +304,13 @@ void setupWebMonitor() {
   webServer.begin();
 }
 
-// 5. Прямой NTRIP-сервер на порту 2101
+// 6. Прямой NTRIP-сервер на порту 2101 (использует новый метод accept())
 void handleLocalNtripClients() {
   if (!localNtripServer.hasClient()) return;
 
-  WiFiClient newClient = localNtripServer.available();
+  WiFiClient newClient = localNtripServer.accept();
+  if (!newClient) return;
+
   unsigned long timeout = millis();
   while (!newClient.available() && millis() - timeout < 1500) delay(5);
 
@@ -290,14 +341,14 @@ void handleLocalNtripClients() {
   newClient.stop();
 }
 
-// 6. Настройка беспроводного обновления ArduinoOTA
+// 7. Настройка беспроводного обновления ArduinoOTA
 void setupOTA() {
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.begin();
 }
 
-// 7. Полная автоконфигурация ZED-F9P при старте
+// 8. Полная автоконфигурация ZED-F9P при старте
 bool configureF9PBase() {
   RTKSerial.setRxBufferSize(4096);
   RTKSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
@@ -345,20 +396,17 @@ bool configureF9PBase() {
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_RTCM3X, 1);
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_UBX, 1);
 
-  // Пакеты поправок MSM7 + телеметрия
+  // Пакеты поправок MSM7
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1005_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1077_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1087_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1097_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1127_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1230_UART1, 5);
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_PVT_UART1, 2);
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_SVIN_UART1, 2);
 
   if (myGNSS.sendCfgValset()) {
-    myGNSS.setRTCMCallbackPtr(&onRTCMData);
     myGNSS.setAutoPVTcallbackPtr(&onPVTData);
-    myGNSS.setAutoSVINcallbackPtr(&onSVINData);
+    myGNSS.setAutoNAVSVINcallbackPtr(&onSVINData);
     return applyBaseModeToF9P();
   }
   return false;
@@ -428,10 +476,8 @@ void loop() {
   }
 
   if (f9pConnected) {
-    myGNSS.checkUblox();
-    myGNSS.checkCallbacks();
+    processUARTStream();
   } else if (millis() - lastF9PRetry > 10000) {
-    // Если ZED-F9P подключили на горячую — подхватываем его автоматически раз в 10 сек
     lastF9PRetry = millis();
     configureF9PBase();
   }
@@ -449,12 +495,12 @@ void loop() {
     last5SecBytes = rtcmBytesGenerated;
     rtcmBytesGenerated = 0;
 
-    Serial.printf("[v%s] Спутников: %2u | Режим: %s | Роверов: %u | RTCM3: %u Б/5с | http://%s\n",
+    Serial.printf("[v%s] Спутников: %2u | Режим: %s | Роверов: %u | RTCM3: %lu Б/5с | http://%s\n",
                   FW_VERSION,
                   currentSIV,
                   useFixedBase ? "FIXED" : (svinValid ? "SVIN-OK" : "SVIN-RUN"),
                   getActiveRoverCount(),
-                  last5SecBytes,
+                  (unsigned long)last5SecBytes,
                   WiFi.localIP().toString().c_str());
   }
 }
