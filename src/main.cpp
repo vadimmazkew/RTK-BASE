@@ -221,7 +221,7 @@ void processUARTStream() {
 
 // 5. Подключение к EFIR-TV WIFI 751 (192.168.0.200) + резервная точка wifi-iot (192.168.4.1)
 void startFallbackAP() {
-  // Оставляем пустой для совместимости, так как AP теперь включена всегда
+  // AP работает постоянно в режиме WIFI_AP_STA
 }
 
 void initNetwork() {
@@ -229,41 +229,55 @@ void initNetwork() {
   WiFi.disconnect(true);
   delay(100);
 
-  // Включаем ДВОЙНОЙ режим: и точка доступа wifi-iot, и подключение к домашнему роутеру одновременно!
+  // Включаем одновременный режим: точка wifi-iot (192.168.4.1) + клиент роутера (192.168.0.200)
   WiFi.mode(WIFI_AP_STA);
 
-  // 1. Сразу на первой секунде поднимаем точку доступа wifi-iot (192.168.4.1)
+  // 1. Мгновенно запускаем точку доступа wifi-iot (будет видна в списке Wi-Fi всегда!)
   IPAddress apIP(192, 168, 4, 1);
   IPAddress apNet(255, 255, 255, 0);
   WiFi.softAPConfig(apIP, apIP, apNet);
-  WiFi.softAP("wifi-iot", "12345678", 1, 0, 4); // Канал 1, открытая видимость (SSID не скрыт)
-  Serial.println("\n[Wi-Fi AP] Точка 'wifi-iot' (пароль 12345678) ЗАПУЩЕНА! Адрес: http://192.168.4.1");
+  WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 4);
+  Serial.println("\n[Wi-Fi AP] Точка 'wifi-iot' (192.168.4.1) ЗАПУЩЕНА!");
 
-  // 2. Параллельно подключаемся к вашему роутеру EFIR-TV WIFI 751 (по DHCP, без конфликтов IP)
-  if (wifiSsid.length() > 0) {
-    Serial.printf("[Wi-Fi STA] Подключение к роутеру '%s'", wifiSsid.c_str());
-    WiFi.setHostname(OTA_HOSTNAME);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  // 2. Настраиваем статический IP 192.168.0.200 для домашнего роутера
+  #if USE_STATIC_IP
+  IPAddress staticIP(STATIC_IP_ADDR);
+  IPAddress gateway(GATEWAY_IP_ADDR);
+  IPAddress subnet(SUBNET_MASK);
+  IPAddress dns(DNS_IP_ADDR);
+  WiFi.config(staticIP, gateway, subnet, dns);
+  #endif
 
-    // Снижаем пиковую мощность передатчика до 15 dBm (защита от просадки питания USB кабеля)
-    WiFi.setTxPower(WIFI_POWER_15dBm);
+  // 3. Пробуем подключиться к EFIR-TV WIFI 751_24 (2.4 ГГц)
+  Serial.printf("[Wi-Fi STA] Пробуем сеть '%s'", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint8_t attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 16) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
 
-    uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  // 4. Если не подключилось — пробуем вторую сеть EFIR-TV WIFI 751
+  #ifdef WIFI_SSID_ALT
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("\n[Wi-Fi STA] Пробуем вторую сеть '%s'", WIFI_SSID_ALT);
+    WiFi.begin(WIFI_SSID_ALT, WIFI_PASSWORD);
+    attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 16) {
       delay(500);
       Serial.print(".");
       attempts++;
     }
   }
+  #endif
 
   if (WiFi.status() == WL_CONNECTED) {
     isApMode = false;
-    Serial.printf("\n[OK] Подключено к роутеру! IP в домашней сети: http://%s\n",
-                  WiFi.localIP().toString().c_str());
+    Serial.printf("\n[OK] Подключено к роутеру! Адрес: http://%s\n", WiFi.localIP().toString().c_str());
   } else {
     isApMode = true;
-    Serial.println("\n[ИНФО] Роутер пока не ответил, работаем через точку 'wifi-iot' (http://192.168.4.1)");
+    Serial.println("\n[ИНФО] Работаем через точку доступа wifi-iot -> http://192.168.4.1");
   }
 
   MDNS.begin(OTA_HOSTNAME);
