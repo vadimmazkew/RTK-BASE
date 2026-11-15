@@ -8,9 +8,9 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.2.1"
-#define RXD2 16  // Подключить к TX1 платы ZED-F9P (URTK1.2)
-#define TXD2 17  // Подключить к RX1 платы ZED-F9P (URTK1.2)
+#define FW_VERSION "1.3.0"
+#define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
+#define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
 
 HardwareSerial RTKSerial(2);
@@ -23,15 +23,24 @@ WiFiClient localRoverClients[MAX_LOCAL_CLIENTS];
 WebServer webServer(80);
 HTTPUpdateServer httpUpdater;
 
-// === Настройки режима базы (хранятся в энергонезависимой памяти NVS) ===
-bool useFixedBase = false;
-double fixedLatDeg = 52.1115330;     // Базовая точка: Пинск
-double fixedLonDeg = 26.1004610;
-double fixedHeightM = 145.000;
-uint32_t svinMinDur = 300;           // Время Survey-In (сек)
-float svinAccLimitM = 2.00;          // Допуск Survey-In (м)
+// === Настройки в энергонезависимой памяти NVS ===
+String wifiSsid     = WIFI_SSID;
+String wifiPass     = WIFI_PASSWORD;
+bool cloudEnabled   = ENABLE_CLOUD_CASTER;
+String casterHost   = CASTER_HOST;
+uint16_t casterPort = CASTER_PORT;
+String casterMount  = MOUNTPOINT;
+String casterPass   = SOURCE_PASSWORD;
 
-// === Переменные живой телеметрии ===
+bool useFixedBase   = false;
+double fixedLatDeg  = 52.1115330;     // Пинск
+double fixedLonDeg  = 26.1004610;
+double fixedHeightM = 145.000;
+uint32_t svinMinDur = 300;
+float svinAccLimitM = 2.00;
+
+// === Состояние сети и телеметрии ===
+bool isApMode = false;
 volatile uint32_t rtcmBytesGenerated = 0;
 uint32_t last5SecBytes = 0;
 uint8_t currentSIV = 0;
@@ -45,9 +54,17 @@ uint32_t svinObsTime = 0;
 float svinMeanAcc = 0.0;
 bool f9pConnected = false;
 
-// 1. Работа с энергонезависимой памятью NVS
+// 1. Загрузка и сохранение всех параметров в NVS
 void loadSettings() {
   prefs.begin("rtk-cfg", true);
+  wifiSsid      = prefs.getString("w_ssid", WIFI_SSID);
+  wifiPass      = prefs.getString("w_pass", WIFI_PASSWORD);
+  cloudEnabled  = prefs.getBool("c_en", ENABLE_CLOUD_CASTER);
+  casterHost    = prefs.getString("c_host", CASTER_HOST);
+  casterPort    = prefs.getUShort("c_port", CASTER_PORT);
+  casterMount   = prefs.getString("c_mnt", MOUNTPOINT);
+  casterPass    = prefs.getString("c_pass", SOURCE_PASSWORD);
+
   useFixedBase  = prefs.getBool("fixed", false);
   fixedLatDeg   = prefs.getDouble("lat", 52.1115330);
   fixedLonDeg   = prefs.getDouble("lon", 26.1004610);
@@ -59,6 +76,14 @@ void loadSettings() {
 
 void saveSettings() {
   prefs.begin("rtk-cfg", false);
+  prefs.putString("w_ssid", wifiSsid);
+  prefs.putString("w_pass", wifiPass);
+  prefs.putBool("c_en", cloudEnabled);
+  prefs.putString("c_host", casterHost);
+  prefs.putUShort("c_port", casterPort);
+  prefs.putString("c_mnt", casterMount);
+  prefs.putString("c_pass", casterPass);
+
   prefs.putBool("fixed", useFixedBase);
   prefs.putDouble("lat", fixedLatDeg);
   prefs.putDouble("lon", fixedLonDeg);
@@ -76,7 +101,6 @@ uint8_t getActiveRoverCount() {
   return count;
 }
 
-// Отправка отфильтрованного пакета RTCM3 всем роверам и в облако
 void broadcastRTCM(const uint8_t *data, size_t len) {
   if (len == 0) return;
   rtcmBytesGenerated += len;
@@ -86,12 +110,12 @@ void broadcastRTCM(const uint8_t *data, size_t len) {
       localRoverClients[i].write(data, len);
     }
   }
-  if (ENABLE_CLOUD_CASTER && cloudCasterClient.connected()) {
+  if (cloudEnabled && !isApMode && cloudCasterClient.connected()) {
     cloudCasterClient.write(data, len);
   }
 }
 
-// 2. Передача координат и режима TMODE3 в ZED-F9P с точностью 0.1 мм (High Precision)
+// 2. Применение режима координат (TMODE3) в ZED-F9P с точностью 0.1 мм
 bool applyBaseModeToF9P() {
   if (!f9pConnected) return false;
 
@@ -110,8 +134,8 @@ bool applyBaseModeToF9P() {
     int32_t hgt_cm    = (int32_t)(hgt_mm_e1 / 100);
     int8_t  hgt_hp    = (int8_t)(hgt_mm_e1 % 100);
 
-    myGNSS.addCfgValset(UBLOX_CFG_TMODE_MODE, 2);     // 2 = Fixed Mode
-    myGNSS.addCfgValset(UBLOX_CFG_TMODE_POS_TYPE, 1); // 1 = LLH (WGS-84)
+    myGNSS.addCfgValset(UBLOX_CFG_TMODE_MODE, 2);
+    myGNSS.addCfgValset(UBLOX_CFG_TMODE_POS_TYPE, 1);
     myGNSS.addCfgValset(UBLOX_CFG_TMODE_LAT, lat_main);
     myGNSS.addCfgValset(UBLOX_CFG_TMODE_LAT_HP, lat_hp);
     myGNSS.addCfgValset(UBLOX_CFG_TMODE_LON, lon_main);
@@ -120,7 +144,7 @@ bool applyBaseModeToF9P() {
     myGNSS.addCfgValset(UBLOX_CFG_TMODE_HEIGHT_HP, hgt_hp);
   } else {
     uint32_t accLimit01mm = (uint32_t)lround(svinAccLimitM * 10000.0f);
-    myGNSS.addCfgValset(UBLOX_CFG_TMODE_MODE, 1);     // 1 = Survey-In
+    myGNSS.addCfgValset(UBLOX_CFG_TMODE_MODE, 1);
     myGNSS.addCfgValset(UBLOX_CFG_TMODE_SVIN_MIN_DUR, svinMinDur);
     myGNSS.addCfgValset(UBLOX_CFG_TMODE_SVIN_ACC_LIMIT, accLimit01mm);
   }
@@ -128,7 +152,7 @@ bool applyBaseModeToF9P() {
   return myGNSS.sendCfgValset();
 }
 
-// 3. Колбэки телеметрии SparkFun v3 (UBX-NAV-PVT и UBX-NAV-SVIN)
+// 3. Колбэки телеметрии ZED-F9P
 void onPVTData(UBX_NAV_PVT_data_t *pvt) {
   if (pvt == nullptr) return;
   currentSIV = pvt->numSV;
@@ -146,11 +170,7 @@ void onSVINData(UBX_NAV_SVIN_data_t *svin) {
   svinMeanAcc = svin->meanAcc / 10000.0f;
 }
 
-// 4. Опрос ZED-F9P и пересылка потока RTCM3
-// Чтобы не блокировать библиотеку SparkFun v3, мы переопределяем метод чтения или
-// используем встроенный колбэк pushRawData / чтение через буфер.
-// Самый надежный способ в v3.1.15: опрашиваем телеметрию раз в 2 секунды, а все
-// остальное время пересылаем бинарный поток напрямую из UART2 с фильтрацией кадров RTCM3 (0xD3).
+// 4. Двухпоточный демультиплексор UART2 (разделяет RTCM3 и UBX для телеметрии)
 void processUARTStream() {
   static uint8_t rtcmBuf[1030];
   static uint16_t rtcmIdx = 0;
@@ -161,47 +181,118 @@ void processUARTStream() {
     uint8_t b = RTKSerial.read();
 
     if (!inRtcmFrame) {
-      if (b == 0xD3) { // Стандартный заголовок пакета RTCM 3.x
+      if (b == 0xD3) {
         inRtcmFrame = true;
         rtcmIdx = 0;
         rtcmBuf[rtcmIdx++] = b;
+      } else {
+        // Все не-RTCM байты (пакеты UBX-NAV-PVT и UBX-NAV-SVIN) отдаем в парсер SparkFun
+        myGNSS.pushRawData(&b, 1);
       }
     } else {
       rtcmBuf[rtcmIdx++] = b;
-
       if (rtcmIdx == 3) {
-        // Байты 1 и 2 содержат 10-битную длину полезной нагрузки (первые 6 бит должны быть 0)
         if ((rtcmBuf[1] & 0xFC) != 0x00) {
-          inRtcmFrame = false; // Ложное совпадение 0xD3
+          // Оказался не RTCM — возвращаем накопленные 3 байта в UBX-парсер
+          myGNSS.pushRawData(rtcmBuf, 3);
+          inRtcmFrame = false;
           rtcmIdx = 0;
         } else {
           uint16_t payloadLen = ((uint16_t)(rtcmBuf[1] & 0x03) << 8) | rtcmBuf[2];
-          rtcmExpectedLen = payloadLen + 6; // 3 байта заголовка + payload + 3 байта CRC24Q
+          rtcmExpectedLen = payloadLen + 6;
           if (rtcmExpectedLen > sizeof(rtcmBuf)) {
             inRtcmFrame = false;
             rtcmIdx = 0;
           }
         }
       } else if (rtcmIdx >= 3 && rtcmIdx == rtcmExpectedLen) {
-        // Полный пакет RTCM3 собран — мгновенно отправляем роверам!
         broadcastRTCM(rtcmBuf, rtcmExpectedLen);
         inRtcmFrame = false;
         rtcmIdx = 0;
       }
     }
   }
+  myGNSS.checkCallbacks();
 }
 
-// 5. Веб-интерфейс управления + Веб-OTA (/update)
+// 5. Настройка Wi-Fi с автоматическим откатом в точку доступа "wifi-iot" (192.168.4.1)
+void startFallbackAP() {
+  isApMode = true;
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+
+  // Жестко фиксируем IP 192.168.4.1 для точки доступа wifi-iot
+  IPAddress local_IP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  Serial.println("\n[Wi-Fi AP] Поднята собственная точка доступа!");
+  Serial.printf("[Wi-Fi AP] Сеть: %s | Пароль: %s | Адрес: http://192.168.4.1\n", AP_SSID, AP_PASSWORD);
+}
+
+void initNetwork() {
+  bool hasValidCreds = (wifiSsid.length() > 0 && wifiSsid != "YOUR_WIFI_SSID");
+
+  if (hasValidCreds) {
+    Serial.printf("\n[Wi-Fi] Подключение к роутеру %s", wifiSsid.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+
+    uint8_t attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 24) { // Ждем 12 секунд
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    isApMode = false;
+    Serial.printf("\n[OK] Подключено к роутеру! IP: http://%s (или http://%s.local)\n",
+                  WiFi.localIP().toString().c_str(), OTA_HOSTNAME);
+  } else {
+    startFallbackAP();
+  }
+
+  MDNS.begin(OTA_HOSTNAME);
+  localNtripServer.begin();
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.begin();
+}
+
+// 6. Веб-панель управления с живым обновлением JSON и настройкой Wi-Fi
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
-  webServer.on("/", HTTP_GET, []() {
-    String fixBadge = !f9pConnected ? "<span style='color:#ff5252;'>Ожидание ZED-F9P (UART)</span>" :
-                      (currentFixType == 5) ? "<span style='color:#4caf50;'>TIME (БАЗА АКТИВНА)</span>" :
-                      (currentFixType == 3) ? "<span style='color:#ff9800;'>3D FIX (Усреднение)</span>" :
-                                              "<span style='color:#f44336;'>Поиск спутников</span>";
+  // API для живого обновления данных без перезагрузки страницы
+  webServer.on("/api/status", HTTP_GET, []() {
+    String fixText = !f9pConnected ? "Ожидание ZED-F9P (UART)" :
+                     (currentFixType == 5) ? "TIME (БАЗА АКТИВНА)" :
+                     (currentFixType == 3) ? "3D FIX (Усреднение)" : "Поиск спутников";
+    String svinText = svinValid ? "ГОТОВО" : (svinActive ? "Накопление..." : "Выкл / Fixed");
+    String netInfo = isApMode ? ("Точка доступа: " + String(AP_SSID) + " (192.168.4.1)") :
+                                ("Роутер: " + wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
+    String json = "{";
+    json += "\"f9p\":" + String(f9pConnected ? "true" : "false") + ",";
+    json += "\"fixType\":" + String(currentFixType) + ",";
+    json += "\"fixText\":\"" + fixText + "\",";
+    json += "\"siv\":" + String(currentSIV) + ",";
+    json += "\"svinText\":\"" + svinText + " (" + String(svinObsTime) + "с / " + String(svinMeanAcc, 2) + "м)\",";
+    json += "\"liveCoords\":\"" + String(liveLatDeg, 7) + ", " + String(liveLonDeg, 7) + " (" + String(liveHeightM, 2) + "м)\",";
+    json += "\"rovers\":" + String(getActiveRoverCount()) + ",";
+    json += "\"bytes\":" + String(last5SecBytes) + ",";
+    json += "\"net\":\"" + netInfo + "\"";
+    json += "}";
+    webServer.send(200, "application/json", json);
+  });
+
+  webServer.on("/", HTTP_GET, []() {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<title>RTK База v" FW_VERSION "</title>"
@@ -224,29 +315,41 @@ void setupWebMonitor() {
       "document.getElementById('lon').value=lon;"
       "document.getElementById('hgt').value=hgt;"
       "}"
+      "setInterval(()=>{"
+      "fetch('/api/status').then(r=>r.json()).then(d=>{"
+      "document.getElementById('s_fix').innerText=d.fixText;"
+      "document.getElementById('s_fix').style.color=(d.fixType==5?'#4caf50':(d.f9p?'#ff9800':'#ff5252'));"
+      "document.getElementById('s_siv').innerText=d.siv+' шт.';"
+      "document.getElementById('s_svin').innerText=d.svinText;"
+      "document.getElementById('s_coords').innerText=d.liveCoords;"
+      "document.getElementById('s_rovers').innerText=d.rovers+' шт.';"
+      "document.getElementById('s_bytes').innerText=d.bytes+' байт';"
+      "document.getElementById('s_net').innerText=d.net;"
+      "}).catch(()=>{});"
+      "}, 2000);"
       "</script></head><body>"
 
+      // Карточка 1: Живая телеметрия
       "<div class='card'>"
       "<h2>📡 RTK База (" + String(LOCAL_MOUNTPOINT) + ") <small style='font-size:12px;color:#888;'>v" FW_VERSION "</small></h2>"
-      "<div class='row'><span>Статус приемника:</span><b>" + fixBadge + "</b></div>"
-      "<div class='row'><span>Спутников в работе:</span><b>" + String(currentSIV) + " шт.</b></div>"
+      "<div class='row'><span>Приемник:</span><b id='s_fix'>Загрузка...</b></div>"
+      "<div class='row'><span>Спутников в работе:</span><b id='s_siv'>" + String(currentSIV) + " шт.</b></div>"
       "<div class='row'><span>Активный режим:</span><b>" + String(useFixedBase ? "FIXED (Постоянный)" : "SURVEY-IN (Авто)") + "</b></div>"
-      "<div class='row'><span>Survey-In статус:</span><b>" + String(svinValid ? "ГОТОВО" : (svinActive ? "Накопление..." : "Выкл")) +
-      " (" + String(svinObsTime) + "с / " + String(svinMeanAcc, 2) + "м)</b></div>"
-      "<div class='row'><span>Текущие WGS-84:</span><b>" + String(liveLatDeg, 7) + ", " + String(liveLonDeg, 7) + "</b></div>"
-      "<div class='row'><span>Роверов на порту " + String(LOCAL_NTRIP_PORT) + ":</span><b>" + String(getActiveRoverCount()) + " шт.</b></div>"
-      "<div class='row'><span>Поток RTCM3 (5 сек):</span><b>" + String(last5SecBytes) + " байт</b></div>"
-      "<div class='row'><span>IP / Сигнал Wi-Fi:</span><b>" + WiFi.localIP().toString() + " (" + String(WiFi.RSSI()) + " dBm)</b></div>"
-      "<a href='/' class='btn btn-refresh'>🔄 Обновить телеметрию</a>"
+      "<div class='row'><span>Survey-In:</span><b id='s_svin'>-</b></div>"
+      "<div class='row'><span>Текущие WGS-84:</span><b id='s_coords'>-</b></div>"
+      "<div class='row'><span>Роверов (Порт " + String(LOCAL_NTRIP_PORT) + "):</span><b id='s_rovers'>0 шт.</b></div>"
+      "<div class='row'><span>Поток RTCM3 (5с):</span><b id='s_bytes'>0 байт</b></div>"
+      "<div class='row'><span>Сеть:</span><b id='s_net' style='font-size:12px;'>-</b></div>"
       "</div>"
 
+      // Карточка 2: Координаты и режим базы
       "<div class='card'>"
       "<h3>⚙️ Координаты и режим базы</h3>"
       "<div style='display:flex;justify-content:space-between;'>"
-      "<button type='button' class='btn btn-preset' onclick='setPreset(52.1115330,26.1004610,145.0)'>📍 Пресет: Пинск</button>"
-      "<button type='button' class='btn btn-preset' onclick='setPreset(52.1480380,26.1744910,146.0)'>🏡 Пресет: Высокое</button>"
+      "<button type='button' class='btn btn-preset' onclick='setPreset(52.1115330,26.1004610,145.0)'>📍 Пинск</button>"
+      "<button type='button' class='btn btn-preset' onclick='setPreset(52.1480380,26.1744910,146.0)'>🏡 Высокое</button>"
       "</div>"
-      "<form action='/save' method='POST'>"
+      "<form action='/save_gnss' method='POST'>"
       "<label>Режим запуска базы:</label>"
       "<select name='mode'>"
       "<option value='0'" + String(!useFixedBase ? " selected" : "") + ">Survey-In (Автоусреднение на месте)</option>"
@@ -263,10 +366,37 @@ void setupWebMonitor() {
       "<input type='number' name='dur' value='" + String(svinMinDur) + "' required>"
       "<input type='number' step='0.01' name='acc' value='" + String(svinAccLimitM, 2) + "' required>"
       "</div>"
-      "<button type='submit' class='btn btn-save'>💾 Сохранить в память и применить</button>"
+      "<button type='submit' class='btn btn-save'>💾 Применить координаты в ZED-F9P</button>"
       "</form>"
       "<form action='/use_current' method='POST'>"
       "<button type='submit' class='btn btn-copy'>🎯 Зафиксировать текущие с неба в FIXED</button>"
+      "</form>"
+      "</div>"
+
+      // Карточка 3: Настройки Wi-Fi и облака (с перезагрузкой)
+      "<div class='card'>"
+      "<h3>🌐 Сеть Wi-Fi и Кастер</h3>"
+      "<form action='/save_net' method='POST'>"
+      "<label>Имя домашнего/рабочего Wi-Fi (SSID):</label>"
+      "<input type='text' name='w_ssid' value='" + wifiSsid + "' placeholder='Оставьте пустым для работы через wifi-iot'>"
+      "<label>Пароль Wi-Fi:</label>"
+      "<input type='password' name='w_pass' value='" + wifiPass + "'>"
+      "<label>Дублировать поток во внешний NTRIP Caster:</label>"
+      "<select name='c_en'>"
+      "<option value='0'" + String(!cloudEnabled ? " selected" : "") + ">Выкл (Только прямой сервер на ESP32)</option>"
+      "<option value='1'" + String(cloudEnabled ? " selected" : "") + ">Вкл (Отправлять на Emlid / свой сервер)</option>"
+      "</select>"
+      "<label>Хост / Порт кастера:</label>"
+      "<div style='display:flex;gap:8px;'>"
+      "<input type='text' name='c_host' value='" + casterHost + "'>"
+      "<input type='number' name='c_port' value='" + String(casterPort) + "' style='width:35%;'>"
+      "</div>"
+      "<label>Точка монтирования / Пароль кастера:</label>"
+      "<div style='display:flex;gap:8px;'>"
+      "<input type='text' name='c_mnt' value='" + casterMount + "'>"
+      "<input type='password' name='c_pass' value='" + casterPass + "'>"
+      "</div>"
+      "<button type='submit' class='btn btn-save'>🔄 Сохранить сеть и перезагрузить</button>"
       "</form>"
       "<a href='/update' class='btn btn-refresh' style='margin-top:16px;font-size:13px;'>📦 Веб-обновление прошивки (.bin)</a>"
       "</div></body></html>";
@@ -274,7 +404,7 @@ void setupWebMonitor() {
     webServer.send(200, "text/html", html);
   });
 
-  webServer.on("/save", HTTP_POST, []() {
+  webServer.on("/save_gnss", HTTP_POST, []() {
     if (webServer.hasArg("mode")) useFixedBase = (webServer.arg("mode").toInt() == 1);
     if (webServer.hasArg("lat"))  fixedLatDeg  = webServer.arg("lat").toDouble();
     if (webServer.hasArg("lon"))  fixedLonDeg  = webServer.arg("lon").toDouble();
@@ -301,10 +431,25 @@ void setupWebMonitor() {
     webServer.send(303);
   });
 
+  webServer.on("/save_net", HTTP_POST, []() {
+    if (webServer.hasArg("w_ssid")) wifiSsid     = webServer.arg("w_ssid");
+    if (webServer.hasArg("w_pass")) wifiPass     = webServer.arg("w_pass");
+    if (webServer.hasArg("c_en"))   cloudEnabled = (webServer.arg("c_en").toInt() == 1);
+    if (webServer.hasArg("c_host")) casterHost   = webServer.arg("c_host");
+    if (webServer.hasArg("c_port")) casterPort   = webServer.arg("c_port").toInt();
+    if (webServer.hasArg("c_mnt"))  casterMount  = webServer.arg("c_mnt");
+    if (webServer.hasArg("c_pass")) casterPass   = webServer.arg("c_pass");
+
+    saveSettings();
+    webServer.send(200, "text/html", "<meta charset='utf-8'><h3>Настройки сохранены! Перезагрузка платы...</h3>");
+    delay(800);
+    ESP.restart();
+  });
+
   webServer.begin();
 }
 
-// 6. Прямой NTRIP-сервер на порту 2101 (использует новый метод accept())
+// 7. Прямой NTRIP-сервер на порту 2101
 void handleLocalNtripClients() {
   if (!localNtripServer.hasClient()) return;
 
@@ -341,14 +486,7 @@ void handleLocalNtripClients() {
   newClient.stop();
 }
 
-// 7. Настройка беспроводного обновления ArduinoOTA
-void setupOTA() {
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.begin();
-}
-
-// 8. Полная автоконфигурация ZED-F9P при старте
+// 8. Автоконфигурация ZED-F9P
 bool configureF9PBase() {
   RTKSerial.setRxBufferSize(4096);
   RTKSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
@@ -361,7 +499,6 @@ bool configureF9PBase() {
       RTKSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
       if (!myGNSS.begin(RTKSerial)) return false;
     } else {
-      Serial.println("[GNSS] ZED-F9P не подключен. Работа в режиме веб-сервера.");
       return false;
     }
   }
@@ -369,7 +506,6 @@ bool configureF9PBase() {
   f9pConnected = true;
   myGNSS.newCfgValset(VAL_LAYER_RAM_BBR);
 
-  // Все 4 спутниковые системы + вторые частоты (включая BeiDou B2I)
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_GPS_ENA, 1);
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_GPS_L1CA_ENA, 1);
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_GPS_L2C_ENA, 1);
@@ -385,24 +521,23 @@ bool configureF9PBase() {
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_SBAS_ENA, 0);
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_QZSS_ENA, 0);
 
-  // Режим Stationary и фильтрация низких спутников
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_DYNMODEL, 2);
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINELEV, 10);
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINCNO, 15);
   myGNSS.addCfgValset(UBLOX_CFG_RATE_MEAS, 1000);
 
-  // Чистый поток RTCM3 + UBX на UART1
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_NMEA, 0);
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_RTCM3X, 1);
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_UBX, 1);
 
-  // Пакеты поправок MSM7
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1005_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1077_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1087_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1097_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1127_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1230_UART1, 5);
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_PVT_UART1, 2);
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_SVIN_UART1, 2);
 
   if (myGNSS.sendCfgValset()) {
     myGNSS.setAutoPVTcallbackPtr(&onPVTData);
@@ -412,33 +547,11 @@ bool configureF9PBase() {
   return false;
 }
 
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint8_t attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    MDNS.begin(OTA_HOSTNAME);
-    localNtripServer.begin();
-    setupOTA();
-    setupWebMonitor();
-    Serial.printf("\n[OK] Веб-панель: http://%s (или http://%s.local)\n", 
-                  WiFi.localIP().toString().c_str(), OTA_HOSTNAME);
-  }
-}
-
 bool connectCloudCaster() {
-  if (!ENABLE_CLOUD_CASTER || cloudCasterClient.connected()) return true;
-  if (!cloudCasterClient.connect(CASTER_HOST, CASTER_PORT)) return false;
+  if (!cloudEnabled || isApMode || cloudCasterClient.connected()) return true;
+  if (!cloudCasterClient.connect(casterHost.c_str(), casterPort)) return false;
 
-  String authHeader = String("SOURCE ") + SOURCE_PASSWORD + " /" + MOUNTPOINT + "\r\n" +
+  String authHeader = "SOURCE " + casterPass + " /" + casterMount + "\r\n" +
                       "Source-Agent: NTRIP ESP32-S3-F9P-Base/" FW_VERSION "\r\n\r\n";
   cloudCasterClient.print(authHeader);
 
@@ -458,10 +571,8 @@ void setup() {
   delay(1500);
   loadSettings();
   configureF9PBase();
-  connectWiFi();
-  if (ENABLE_CLOUD_CASTER && WiFi.status() == WL_CONNECTED) {
-    connectCloudCaster();
-  }
+  initNetwork();
+  setupWebMonitor();
 }
 
 void loop() {
@@ -469,11 +580,9 @@ void loop() {
   static uint32_t lastReconnectAttempt = 0;
   static uint32_t lastF9PRetry = 0;
 
-  if (WiFi.status() == WL_CONNECTED) {
-    ArduinoOTA.handle();
-    webServer.handleClient();
-    handleLocalNtripClients();
-  }
+  ArduinoOTA.handle();
+  webServer.handleClient();
+  handleLocalNtripClients();
 
   if (f9pConnected) {
     processUARTStream();
@@ -484,8 +593,10 @@ void loop() {
 
   if (millis() - lastReconnectAttempt > 5000) {
     lastReconnectAttempt = millis();
-    if (WiFi.status() != WL_CONNECTED) connectWiFi();
-    if (ENABLE_CLOUD_CASTER && WiFi.status() == WL_CONNECTED && !cloudCasterClient.connected()) {
+    if (!isApMode && WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+    }
+    if (cloudEnabled && !isApMode && WiFi.status() == WL_CONNECTED && !cloudCasterClient.connected()) {
       connectCloudCaster();
     }
   }
@@ -495,12 +606,12 @@ void loop() {
     last5SecBytes = rtcmBytesGenerated;
     rtcmBytesGenerated = 0;
 
-    Serial.printf("[v%s] Спутников: %2u | Режим: %s | Роверов: %u | RTCM3: %lu Б/5с | http://%s\n",
+    Serial.printf("[v%s] Спутников: %2u | Режим: %s | Роверов: %u | RTCM3: %lu Б/5с | Адрес: http://%s\n",
                   FW_VERSION,
                   currentSIV,
                   useFixedBase ? "FIXED" : (svinValid ? "SVIN-OK" : "SVIN-RUN"),
                   getActiveRoverCount(),
                   (unsigned long)last5SecBytes,
-                  WiFi.localIP().toString().c_str());
+                  isApMode ? "192.168.4.1 (AP: wifi-iot)" : WiFi.localIP().toString().c_str());
   }
 }
