@@ -9,10 +9,11 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.3.2"
+#define FW_VERSION "1.4.0"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
+#define MAX_DISPLAY_SATS  48
 
 HardwareSerial RTKSerial(2);
 SFE_UBLOX_GNSS_SERIAL myGNSS;
@@ -24,7 +25,7 @@ WiFiClient localRoverClients[MAX_LOCAL_CLIENTS];
 WebServer webServer(80);
 HTTPUpdateServer httpUpdater;
 
-// === Настройки (по умолчанию сразу берем EFIR-TV WIFI 751) ===
+// === Настройки в энергонезависимой памяти NVS ===
 String wifiSsid     = WIFI_SSID;
 String wifiPass     = WIFI_PASSWORD;
 bool cloudEnabled   = ENABLE_CLOUD_CASTER;
@@ -46,6 +47,7 @@ volatile uint32_t rtcmBytesGenerated = 0;
 uint32_t last5SecBytes = 0;
 uint8_t currentSIV = 0;
 uint8_t currentFixType = 0;
+float currentPDOP = 99.9f;
 double liveLatDeg = 0.0;
 double liveLonDeg = 0.0;
 double liveHeightM = 0.0;
@@ -55,7 +57,21 @@ uint32_t svinObsTime = 0;
 float svinMeanAcc = 0.0;
 bool f9pConnected = false;
 
-// 1. Загрузка и сохранение настроек в NVS (новый раздел rtk-v2, чтобы сбросить старые заглушки)
+// === Структура данных для графика спутников (GPSTest UI) ===
+struct SatInfo {
+  char sysChar;     // G=GPS, R=GLONASS, E=Galileo, B=BeiDou
+  uint8_t svId;     // Номер спутника
+  uint8_t cno;      // Уровень сигнала (SNR / C/N0, dBHz)
+  int8_t elev;      // Угол возвышения (градусы)
+  bool used;        // Используется ли в решении RTK
+};
+
+SatInfo satList[MAX_DISPLAY_SATS];
+uint8_t satsInView = 0;
+uint8_t satsInUse  = 0;
+float avgSnr       = 0.0f;
+
+// 1. Загрузка и сохранение настроек в NVS
 void loadSettings() {
   prefs.begin("rtk-v2", true);
   wifiSsid      = prefs.getString("w_ssid", WIFI_SSID);
@@ -74,7 +90,6 @@ void loadSettings() {
   svinAccLimitM = prefs.getFloat("acc", 2.00f);
   prefs.end();
 
-  // Защита: если в NVS случайно осталась заглушка, принудительно ставим ваш Wi-Fi
   if (wifiSsid == "YOUR_WIFI_SSID" || wifiSsid.length() == 0) {
     wifiSsid = WIFI_SSID;
     wifiPass = WIFI_PASSWORD;
@@ -159,11 +174,12 @@ bool applyBaseModeToF9P() {
   return myGNSS.sendCfgValset();
 }
 
-// 3. Колбэки телеметрии ZED-F9P
+// 3. Колбэки телеметрии ZED-F9P (PVT, SVIN и детальный спектр спутников NAV-SAT)
 void onPVTData(UBX_NAV_PVT_data_t *pvt) {
   if (pvt == nullptr) return;
   currentSIV = pvt->numSV;
   currentFixType = pvt->fixType;
+  currentPDOP = pvt->pDOP / 100.0f;
   liveLatDeg = pvt->lat / 1e7;
   liveLonDeg = pvt->lon / 1e7;
   liveHeightM = pvt->height / 1000.0;
@@ -175,6 +191,60 @@ void onSVINData(UBX_NAV_SVIN_data_t *svin) {
   svinValid = (svin->valid == 1);
   svinObsTime = svin->dur;
   svinMeanAcc = svin->meanAcc / 10000.0f;
+}
+
+void onSATData(UBX_NAV_SAT_data_t *sat) {
+  if (sat == nullptr) return;
+
+  uint8_t total = sat->header.numSVs;
+  uint8_t count = 0;
+  uint8_t usedCount = 0;
+  uint32_t snrSum = 0;
+  uint8_t snrCount = 0;
+
+  for (uint8_t i = 0; i < total && count < MAX_DISPLAY_SATS; i++) {
+    uint8_t gnssId = sat->blocks[i].gnssId;
+    uint8_t cno    = sat->blocks[i].cno;
+    bool isUsed    = (sat->blocks[i].flags.bits.svUsed == 1);
+
+    // Фильтруем только спутники с реальным сигналом (>0 dBHz) или в слежении
+    if (cno == 0) continue;
+
+    char sChar = 'G';
+    if (gnssId == 0) sChar = 'G';      // GPS
+    else if (gnssId == 2) sChar = 'E'; // Galileo
+    else if (gnssId == 3) sChar = 'B'; // BeiDou
+    else if (gnssId == 6) sChar = 'R'; // GLONASS
+    else sChar = 'S';
+
+    satList[count].sysChar = sChar;
+    satList[count].svId    = sat->blocks[i].svId;
+    satList[count].cno     = cno;
+    satList[count].elev    = sat->blocks[i].elev;
+    satList[count].used    = isUsed;
+    count++;
+
+    if (isUsed) usedCount++;
+    if (cno > 0) {
+      snrSum += cno;
+      snrCount++;
+    }
+  }
+
+  // Сортируем спутники: сначала используемые и с лучшим сигналом
+  for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t j = i + 1; j < count; j++) {
+      if (satList[j].cno > satList[i].cno) {
+        SatInfo tmp = satList[i];
+        satList[i] = satList[j];
+        satList[j] = tmp;
+      }
+    }
+  }
+
+  satsInView = total;
+  satsInUse  = usedCount;
+  avgSnr     = (snrCount > 0) ? ((float)snrSum / snrCount) : 0.0f;
 }
 
 // 4. Двухпоточный демультиплексор UART2 (RTCM3 + UBX)
@@ -220,11 +290,7 @@ void processUARTStream() {
   myGNSS.checkCallbacks();
 }
 
-// 5. Подключение к EFIR-TV WIFI 751 (192.168.0.200) + резервная точка wifi-iot (192.168.4.1)
-void startFallbackAP() {
-  // AP работает постоянно в режиме WIFI_AP_STA
-}
-
+// 5. Инициализация сети с поддержкой 13 канала Wi-Fi (2472 МГц)
 void initNetwork() {
   WiFi.persistent(false);
   WiFi.disconnect(true);
@@ -232,7 +298,6 @@ void initNetwork() {
 
   WiFi.mode(WIFI_AP_STA);
 
-  // 1. КРИТИЧНО: Разблокируем 13-й канал Wi-Fi (2472 МГц) для Беларуси/Европы!
   wifi_country_t country = {
     .cc = "BY",
     .schan = 1,
@@ -242,7 +307,6 @@ void initNetwork() {
   };
   esp_wifi_set_country(&country);
 
-  // 2. Настраиваем статический IP 192.168.0.200
   #if USE_STATIC_IP
   IPAddress staticIP(STATIC_IP_ADDR);
   IPAddress gateway(GATEWAY_IP_ADDR);
@@ -251,7 +315,6 @@ void initNetwork() {
   WiFi.config(staticIP, gateway, subnet, dns);
   #endif
 
-  // 3. Сначала подключаемся к домашнему роутеру (проверяем сеть из веб-панели и обе ваши сети на 2472 МГц)
   const char* netsToTry[] = { wifiSsid.c_str(), "EFIR-TV WIFI 751", "EFIR TV WIFI 751_24" };
 
   for (int i = 0; i < 3; i++) {
@@ -260,7 +323,7 @@ void initNetwork() {
     WiFi.begin(netsToTry[i], wifiPass.c_str());
 
     uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 16) { // Ждем 8 секунд
+    while (WiFi.status() != WL_CONNECTED && attempts < 16) {
       delay(500);
       Serial.print(".");
       attempts++;
@@ -271,7 +334,6 @@ void initNetwork() {
     }
   }
 
-  // 4. Определяем канал роутера (у вас это 13-й канал) и запускаем wifi-iot на том же канале!
   int activeChannel = (WiFi.status() == WL_CONNECTED) ? WiFi.channel() : 1;
 
   IPAddress apIP(192, 168, 4, 1);
@@ -285,7 +347,7 @@ void initNetwork() {
                   wifiSsid.c_str(), activeChannel, WiFi.localIP().toString().c_str());
   } else {
     isApMode = true;
-    Serial.println("\n[ИНФО] Роутер не ответил, работаем через wifi-iot (http://192.168.4.1)");
+    Serial.println("\n[ИНФО] Работаем через точку доступа wifi-iot (http://192.168.4.1)");
   }
 
   MDNS.begin(OTA_HOSTNAME);
@@ -294,16 +356,17 @@ void initNetwork() {
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.begin();
 }
-// 6. Веб-панель управления (Порт 80)
+
+// 6. Веб-интерфейс с живым графиком спектра спутников (GPSTest UI)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
   webServer.on("/api/status", HTTP_GET, []() {
-    String fixText = !f9pConnected ? "Ожидание ZED-F9P (UART)" :
+    String fixText = !f9pConnected ? "Ожидание ZED-F9P" :
                      (currentFixType == 5) ? "TIME (БАЗА АКТИВНА)" :
-                     (currentFixType == 3) ? "3D FIX (Усреднение)" : "Поиск спутников";
+                     (currentFixType == 3) ? "3D Fix" : "Поиск неба";
     String svinText = svinValid ? "ГОТОВО" : (svinActive ? "Накопление..." : "Выкл / Fixed");
-    String netInfo = isApMode ? ("Точка доступа: " + String(AP_SSID) + " (192.168.4.1)") :
+    String netInfo = isApMode ? ("AP: " + String(AP_SSID) + " (192.168.4.1)") :
                                 (wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
     String json = "{";
@@ -311,12 +374,29 @@ void setupWebMonitor() {
     json += "\"fixType\":" + String(currentFixType) + ",";
     json += "\"fixText\":\"" + fixText + "\",";
     json += "\"siv\":" + String(currentSIV) + ",";
+    json += "\"inView\":" + String(satsInView) + ",";
+    json += "\"inUse\":" + String(satsInUse > 0 ? satsInUse : currentSIV) + ",";
+    json += "\"pdop\":\"" + String(currentPDOP, 1) + "\",";
+    json += "\"avgSnr\":" + String(avgSnr, 1) + ",";
     json += "\"svinText\":\"" + svinText + " (" + String(svinObsTime) + "с / " + String(svinMeanAcc, 2) + "м)\",";
     json += "\"liveCoords\":\"" + String(liveLatDeg, 7) + ", " + String(liveLonDeg, 7) + " (" + String(liveHeightM, 2) + "м)\",";
     json += "\"rovers\":" + String(getActiveRoverCount()) + ",";
     json += "\"bytes\":" + String(last5SecBytes) + ",";
-    json += "\"net\":\"" + netInfo + "\"";
-    json += "}";
+    json += "\"net\":\"" + netInfo + "\",";
+
+    // Массив спутников для отрисовки столбиков SNR
+    json += "\"sats\":[";
+    uint8_t outCount = 0;
+    for (uint8_t i = 0; i < MAX_DISPLAY_SATS && i < satsInView; i++) {
+      if (satList[i].cno == 0) continue;
+      if (outCount > 0) json += ",";
+      json += "{\"id\":\"" + String(satList[i].sysChar) + String(satList[i].svId) + "\",";
+      json += "\"cno\":" + String(satList[i].cno) + ",";
+      json += "\"used\":" + String(satList[i].used ? 1 : 0) + "}";
+      outCount++;
+      if (outCount >= 28) break; // Показываем топ-28 спутников на экране
+    }
+    json += "]}";
     webServer.send(200, "application/json", json);
   });
 
@@ -325,17 +405,31 @@ void setupWebMonitor() {
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<title>RTK База v" FW_VERSION "</title>"
       "<style>"
-      "body{font-family:-apple-system,sans-serif;background:#121212;color:#eee;margin:0;padding:12px;}"
-      ".card{background:#1e1e1e;padding:16px;border-radius:10px;max-width:480px;margin:0 auto 14px;box-shadow:0 4px 10px rgba(0,0,0,0.4);}"
-      "h2,h3{margin-top:0;color:#64b5f6;}"
-      ".row{display:flex;justify-content:space-between;margin:8px 0;border-bottom:1px solid #2c2c2c;padding-bottom:6px;font-size:14px;}"
-      "label{display:block;margin-top:10px;font-size:13px;color:#aaa;}"
-      "input,select{width:100%;padding:10px;margin-top:4px;background:#2b2b2b;border:1px solid #444;color:#fff;border-radius:6px;box-sizing:border-box;font-size:15px;}"
-      ".btn{display:block;width:100%;padding:11px;margin-top:12px;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box;}"
+      "body{font-family:-apple-system,sans-serif;background:#0b0e14;color:#eee;margin:0;padding:10px;}"
+      ".card{background:#151922;padding:14px;border-radius:12px;max-width:500px;margin:0 auto 12px;border:1px solid #262c3a;box-shadow:0 4px 12px rgba(0,0,0,0.5);}"
+      "h2,h3{margin-top:0;color:#64b5f6;font-size:18px;}"
+      ".top-grid{display:grid;grid-template-columns:1.2fr 0.8fr;gap:8px;margin-bottom:10px;}"
+      ".stat-box{background:#090b10;border:1px solid #2c3344;border-radius:8px;padding:10px;}"
+      ".stat-title{font-size:12px;color:#9aa0a6;}"
+      ".stat-val{font-size:24px;font-weight:bold;margin-top:4px;}"
+      ".sky-panel{background:#050826;border:1px solid #2b3358;border-radius:10px;padding:12px;margin-bottom:10px;}"
+      ".sky-counts{display:flex;justify-content:space-between;margin-bottom:8px;}"
+      ".bars-wrap{display:flex;align-items:flex-end;gap:4px;height:150px;overflow-x:auto;padding-top:18px;border-bottom:1px solid #394264;}"
+      ".bar-col{display:flex;flex-direction:column;align-items:center;min-width:24px;}"
+      ".bar-val{font-size:10px;color:#fff;margin-bottom:2px;}"
+      ".bar-fill{width:18px;border-radius:3px 3px 0 0;transition:height 0.3s;}"
+      ".bar-dot{width:6px;height:6px;border-radius:50%;margin:4px 0 3px;}"
+      ".bar-id{font-size:10px;background:#e0e0e0;color:#000;font-weight:bold;border-radius:3px;padding:1px 3px;}"
+      ".snr-bar{height:12px;border-radius:6px;background:linear-gradient(90deg,#d32f2f 0% 15%,#f57c00 15% 30%,#fbc02d 30% 50%,#64dd17 50% 100%);position:relative;margin-top:16px;}"
+      ".snr-pin{position:absolute;top:-18px;transform:translateX(-50%);background:#fbc02d;color:#000;font-size:11px;font-weight:bold;padding:1px 6px;border-radius:8px;}"
+      ".row{display:flex;justify-content:space-between;margin:7px 0;border-bottom:1px solid #222733;padding-bottom:5px;font-size:13px;}"
+      "label{display:block;margin-top:10px;font-size:12px;color:#aaa;}"
+      "input,select{width:100%;padding:9px;margin-top:4px;background:#202634;border:1px solid #384152;color:#fff;border-radius:6px;box-sizing:border-box;font-size:14px;}"
+      ".btn{display:block;width:100%;padding:11px;margin-top:10px;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box;}"
       ".btn-save{background:#2e7d32;color:#fff;}"
       ".btn-copy{background:#1565c0;color:#fff;}"
-      ".btn-preset{background:#37474f;color:#fff;width:48%;display:inline-block;margin-top:8px;}"
-      ".btn-refresh{background:#424242;color:#fff;}"
+      ".btn-preset{background:#37474f;color:#fff;width:48%;display:inline-block;margin-top:6px;}"
+      ".btn-refresh{background:#303644;color:#fff;}"
       "</style>"
       "<script>"
       "function setPreset(lat,lon,hgt){"
@@ -343,24 +437,67 @@ void setupWebMonitor() {
       "document.getElementById('lon').value=lon;"
       "document.getElementById('hgt').value=hgt;"
       "}"
-      "setInterval(()=>{"
+      "function barColor(c){"
+      "if(c>=30)return '#76ff03';"
+      "if(c>=20)return '#ffea00';"
+      "if(c>=10)return '#ff6d00';"
+      "return '#d50000';"
+      "}"
+      "function updateUI(){"
       "fetch('/api/status').then(r=>r.json()).then(d=>{"
       "document.getElementById('s_fix').innerText=d.fixText;"
-      "document.getElementById('s_fix').style.color=(d.fixType==5?'#4caf50':(d.f9p?'#ff9800':'#ff5252'));"
-      "document.getElementById('s_siv').innerText=d.siv+' шт.';"
+      "document.getElementById('s_fix').style.color=(d.fixType==5?'#00e676':(d.f9p?'#76ff03':'#ff5252'));"
+      "document.getElementById('s_pdop').innerText=d.pdop;"
+      "document.getElementById('s_view').innerText=d.inView;"
+      "document.getElementById('s_use').innerText=d.inUse;"
       "document.getElementById('s_svin').innerText=d.svinText;"
       "document.getElementById('s_coords').innerText=d.liveCoords;"
       "document.getElementById('s_rovers').innerText=d.rovers+' шт.';"
       "document.getElementById('s_bytes').innerText=d.bytes+' байт';"
       "document.getElementById('s_net').innerText=d.net;"
+      "let avg=d.avgSnr||0;"
+      "document.getElementById('snr_val').innerText=avg.toFixed(1);"
+      "document.getElementById('snr_pin').style.left=Math.min(Math.max(avg,5),95)+'%';"
+      "let bw=document.getElementById('bars');"
+      "if(!d.sats||d.sats.length===0){"
+      "bw.innerHTML='<div style=\"margin:auto;color:#6c7593;font-size:13px;\">Ожидание данных спектра от ZED-F9P...</div>';"
+      "}else{"
+      "let h='';"
+      "d.sats.forEach(s=>{"
+      "let px=Math.min(Math.max(s.cno*2.4,6),125);"
+      "let col=barColor(s.cno);"
+      "let dot=s.used?'#00e676':'#555';"
+      "h+='<div class=\"bar-col\"><div class=\"bar-val\">'+s.cno+'</div>'"
+      "+'<div class=\"bar-fill\" style=\"height:'+px+'px;background:'+col+';\"></div>'"
+      "+'<div class=\"bar-dot\" style=\"background:'+dot+';\"></div>'"
+      "+'<div class=\"bar-id\">'+s.id+'</div></div>';"
+      "});"
+      "bw.innerHTML=h;"
+      "}"
       "}).catch(()=>{});"
-      "}, 2000);"
+      "}"
+      "setInterval(updateUI,2000);"
+      "window.onload=updateUI;"
       "</script></head><body>"
 
+      // Карточка 1: Спектр GNSS в стиле GPSTest
       "<div class='card'>"
-      "<h2>📡 RTK База (" + String(LOCAL_MOUNTPOINT) + ") <small style='font-size:12px;color:#888;'>v" FW_VERSION "</small></h2>"
-      "<div class='row'><span>Приемник:</span><b id='s_fix'>Загрузка...</b></div>"
-      "<div class='row'><span>Спутников в работе:</span><b id='s_siv'>" + String(currentSIV) + " шт.</b></div>"
+      "<h2>🛰️ RTK База (" + String(LOCAL_MOUNTPOINT) + ") <small style='font-size:12px;color:#888;'>v" FW_VERSION "</small></h2>"
+      "<div class='top-grid'>"
+      "<div class='stat-box'><div class='stat-title'>Статус GNSS</div><div id='s_fix' class='stat-val' style='font-size:17px;'>Загрузка...</div></div>"
+      "<div class='stat-box'><div class='stat-title'>PDOP (Геометрия)</div><div id='s_pdop' class='stat-val' style='color:#00e5ff;'>-</div></div>"
+      "</div>"
+
+      "<div class='sky-panel'>"
+      "<div class='sky-counts'>"
+      "<div><div class='stat-title'>В поле зрения</div><div id='s_view' style='font-size:22px;font-weight:bold;'>0</div></div>"
+      "<div style='text-align:right;'><div class='stat-title'>В использовании</div><div id='s_use' style='font-size:22px;font-weight:bold;color:#76ff03;'>0</div></div>"
+      "</div>"
+      "<div id='bars' class='bars-wrap'></div>"
+      "<div style='margin-top:10px;font-size:11px;color:#9aa0a6;'>AVG SNR (Средний уровень сигнала, dBHz):</div>"
+      "<div class='snr-bar'><div id='snr_pin' class='snr-pin' style='left:30%;'><span id='snr_val'>0.0</span></div></div>"
+      "</div>"
+
       "<div class='row'><span>Активный режим:</span><b>" + String(useFixedBase ? "FIXED (Постоянный)" : "SURVEY-IN (Авто)") + "</b></div>"
       "<div class='row'><span>Survey-In:</span><b id='s_svin'>-</b></div>"
       "<div class='row'><span>Текущие WGS-84:</span><b id='s_coords'>-</b></div>"
@@ -369,6 +506,7 @@ void setupWebMonitor() {
       "<div class='row'><span>Сеть:</span><b id='s_net' style='font-size:12px;'>" + WiFi.localIP().toString() + "</b></div>"
       "</div>"
 
+      // Карточка 2: Координаты
       "<div class='card'>"
       "<h3>⚙️ Координаты и режим базы</h3>"
       "<div style='display:flex;justify-content:space-between;'>"
@@ -399,6 +537,7 @@ void setupWebMonitor() {
       "</form>"
       "</div>"
 
+      // Карточка 3: Сеть
       "<div class='card'>"
       "<h3>🌐 Сеть Wi-Fi и Кастер</h3>"
       "<form action='/save_net' method='POST'>"
@@ -511,7 +650,7 @@ void handleLocalNtripClients() {
   newClient.stop();
 }
 
-// 8. Автоконфигурация ZED-F9P
+// 8. Автоконфигурация ZED-F9P (с включением пакета спектра UBX-NAV-SAT)
 bool configureF9PBase() {
   RTKSerial.setRxBufferSize(4096);
   RTKSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
@@ -555,18 +694,23 @@ bool configureF9PBase() {
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_RTCM3X, 1);
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_UBX, 1);
 
+  // Пакеты поправок RTCM3 MSM7
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1005_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1077_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1087_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1097_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1127_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1230_UART1, 5);
+
+  // Пакеты телеметрии и спектра спутников (UBX-NAV-SAT раз в 2 сек)
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_PVT_UART1, 2);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_SVIN_UART1, 2);
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_SAT_UART1, 2);
 
   if (myGNSS.sendCfgValset()) {
     myGNSS.setAutoPVTcallbackPtr(&onPVTData);
     myGNSS.setAutoNAVSVINcallbackPtr(&onSVINData);
+    myGNSS.setAutoNAVSATcallbackPtr(&onSATData);
     return applyBaseModeToF9P();
   }
   return false;
@@ -595,12 +739,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   loadSettings();
-
-  // Сначала поднимаем Wi-Fi и веб-сервер (чтобы плата сразу появилась в сети за 3 секунды)
   initNetwork();
   setupWebMonitor();
-
-  // Затем ищем ZED-F9P
   configureF9PBase();
 }
 
@@ -635,12 +775,11 @@ void loop() {
     last5SecBytes = rtcmBytesGenerated;
     rtcmBytesGenerated = 0;
 
-    Serial.printf("[v%s] Спутников: %2u | Режим: %s | Роверов: %u | RTCM3: %lu Б/5с | Адрес: http://%s\n",
+    Serial.printf("[v%s] Спутников: %2u | AVG SNR: %.1f | RTCM3: %lu Б/5с | Адрес: http://%s\n",
                   FW_VERSION,
                   currentSIV,
-                  useFixedBase ? "FIXED" : (svinValid ? "SVIN-OK" : "SVIN-RUN"),
-                  getActiveRoverCount(),
+                  avgSnr,
                   (unsigned long)last5SecBytes,
-                  isApMode ? "192.168.4.1 (AP: wifi-iot)" : WiFi.localIP().toString().c_str());
+                  isApMode ? "192.168.4.1" : WiFi.localIP().toString().c_str());
   }
 }
