@@ -9,7 +9,7 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.5.1"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
@@ -58,8 +58,8 @@ float svinMeanAcc = 0.0;
 bool f9pConnected = false;
 
 // === Параметры монитора ВЧ-помех и антенны (UBX-MON-RF) ===
-uint8_t jammerState = 0;   // 0 = OK, 1 = Warning, 2 = Critical Jamming
-uint8_t noisePer    = 0;   // Уровень шума в %
+uint8_t jammerState = 0;     // 0/1 = OK, 2 = Warning, 3 = Critical Jamming
+uint16_t noisePer   = 0;     // Уровень шума приемника
 String antennaStatus = "OK"; // OK, OPEN, SHORT
 
 // === Структура данных для графика спектра спутников (GPSTest UI) ===
@@ -252,15 +252,17 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
 
 void onMONRFData(UBX_MON_RF_data_t *rf) {
   if (rf == nullptr || rf->header.nBlocks == 0) return;
-  noisePer = rf->block[0].noisePerMS;
-  jammerState = rf->block[0].jammingState;
 
-  uint8_t antStat = rf->block[0].antStatus;
-  if (antStat == 1) antennaStatus = "INIT";
+  // ИСПРАВЛЕНО: обращаемся к массиву blocks[0]
+  noisePer = rf->blocks[0].noisePerMS;
+  jammerState = rf->blocks[0].flags.bits.jammingState;
+
+  uint8_t antStat = rf->blocks[0].antStatus;
+  if (antStat == 1) antennaStatus = "DONTKNOW";
   else if (antStat == 2) antennaStatus = "OK";
-  else if (antStat == 3) antennaStatus = "SHORT";
-  else if (antStat == 4) antennaStatus = "OPEN";
-  else antennaStatus = "UNKNOWN";
+  else if (antStat == 3) antennaStatus = "SHORT (КЗ)";
+  else if (antStat == 4) antennaStatus = "OPEN (Обрыв)";
+  else antennaStatus = "OK";
 }
 
 // 4. Двухпоточный демультиплексор UART2 (RTCM3 + UBX)
@@ -373,7 +375,7 @@ void initNetwork() {
   ArduinoOTA.begin();
 }
 
-// 6. Веб-интерфейс v1.5.0 (с мониторингом помех и антенны)
+// 6. Веб-интерфейс v1.5.1 (с мониторингом помех и антенны)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
@@ -385,7 +387,7 @@ void setupWebMonitor() {
     String netInfo = isApMode ? ("AP: " + String(AP_SSID) + " (192.168.4.1)") :
                                 (wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
-    String jamText = (jammerState == 2) ? "КРИТИЧЕСКИЕ ПОМЕХИ!" : (jammerState == 1 ? "Слабые помехи" : "Чисто (0%)");
+    String jamText = (jammerState == 3) ? "КРИТИЧЕСКИЕ ПОМЕХИ!" : (jammerState == 2 ? "Слабые помехи" : "Чисто (Норма)");
 
     String json = "{";
     json += "\"f9p\":" + String(f9pConnected ? "true" : "false") + ",";
@@ -654,7 +656,7 @@ void handleLocalNtripClients() {
   if (request.startsWith("GET / ") || request.startsWith("GET / HTTP")) {
     String sourceTable = 
       "SOURCETABLE 200 OK\r\nContent-Type: text/plain\r\n\r\n"
-      "STR;" + String(LOCAL_MOUNTPOINT) + ";Pinsk;RTCM 3.3;1005(1),1077(1),1087(1),1097(1),1127(1),1230(5);2;GPS+GLO+GAL+BDS;LOCAL;BLR;" +
+      "STR;" + String(LOCAL_MOUNTPOINT) + ";Pinsk;RTCM 3.3;1005(1),1006(5),1077(1),1087(1),1097(1),1127(1),1230(5);2;GPS+GLO+GAL+BDS;LOCAL;BLR;" +
       String(fixedLatDeg, 2) + ";" + String(fixedLonDeg, 2) + ";0;0;ESP32-F9P;none;N;N;9600;\r\nENDSOURCETABLE\r\n";
     newClient.print(sourceTable);
     delay(50);
@@ -672,23 +674,21 @@ void handleLocalNtripClients() {
   newClient.stop();
 }
 
-// 8. Автоконфигурация ZED-F9P (100% максимум: 460800 бод, MSM7, эфемериды, калибровка антенны, MON-RF)
+// 8. Автоконфигурация ZED-F9P (460800 бод, 4 системы, MSM7, 1005+1006, MON-RF)
 bool configureF9PBase() {
   RTKSerial.setRxBufferSize(4096);
-  // Аппаратный максимум скорости между ESP32-S3 и ZED-F9P (460800 бод)
   RTKSerial.begin(460800, SERIAL_8N1, RXD2, TXD2);
 
   if (!myGNSS.begin(RTKSerial)) {
-    // Резервный поиск на 115200 и переключение на 460800
     RTKSerial.begin(115200, SERIAL_8N1, RXD2, TXD2);
-    if (myGNSS.begin(RTKSerial)) {
-      myGNSS.setSerialRate(460800, COM_PORT_UART1);
-      delay(250);
-      RTKSerial.begin(460800, SERIAL_8N1, RXD2, TXD2);
+    if (!myGNSS.begin(RTKSerial)) {
+      RTKSerial.begin(38400, SERIAL_8N1, RXD2, TXD2);
       if (!myGNSS.begin(RTKSerial)) return false;
-    } else {
-      return false;
     }
+    myGNSS.setSerialRate(460800, COM_PORT_UART1);
+    delay(250);
+    RTKSerial.begin(460800, SERIAL_8N1, RXD2, TXD2);
+    if (!myGNSS.begin(RTKSerial)) return false;
   }
 
   f9pConnected = true;
@@ -719,34 +719,26 @@ bool configureF9PBase() {
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_RTCM3X, 1);
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_UBX, 1);
 
-  // 1. Пакеты поправок RTCM3 MSM7 (1 Гц)
+  // 1. Пакеты поправок RTCM3 MSM7 (1 Гц) + координаты базы (1005 и 1006)
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1005_UART1, 1);
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1006_UART1, 5);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1077_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1087_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1097_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1127_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1230_UART1, 5);
 
-  // 2. Пакеты координат и антенны (1006 вместо 1005 + 1033 описание антенны)
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1006_UART1, 1);
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1033_UART1, 10); // раз в 10 сек
-
-  // 3. Пакеты быстрых эфемерид орбиты (каждые 10 секунд для мгновенного фикса ровера)
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1019_UART1, 10); // GPS Ephemeris
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1020_UART1, 10); // GLO Ephemeris
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1042_UART1, 10); // BDS Ephemeris
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1046_UART1, 10); // GAL Ephemeris
-
-  // 4. Телеметрия и контроль качества (UBX-NAV-PVT, SVIN, SAT, MON-RF)
+  // 2. Телеметрия и контроль качества (UBX-NAV-PVT, SVIN, SAT, MON-RF)
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_PVT_UART1, 2);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_SVIN_UART1, 2);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_SAT_UART1, 2);
-  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_MON_RF_UART1, 5); // Монитор ВЧ-помех и антенны
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_MON_RF_UART1, 5);
 
   if (myGNSS.sendCfgValset()) {
     myGNSS.setAutoPVTcallbackPtr(&onPVTData);
     myGNSS.setAutoNAVSVINcallbackPtr(&onSVINData);
     myGNSS.setAutoNAVSATcallbackPtr(&onSATData);
-    myGNSS.setAutoMONRFcallbackPtr(&onMONRFData);
+    myGNSS.setAutoMONRF2callbackPtr(&onMONRFData); // ИСПРАВЛЕНО для v3.1.15
     return applyBaseModeToF9P();
   }
   return false;
