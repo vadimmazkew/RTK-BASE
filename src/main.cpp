@@ -6,14 +6,18 @@
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
 #include <Preferences.h>
+#include <FS.h>
+#include <LittleFS.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.7.0"
+#define FW_VERSION "1.8.0"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
 #define MAX_DISPLAY_SATS  48
+#define STATIC_LOG_FILE   "/static_base.rtcm3"
+#define MAX_LOG_SIZE_BYTES (1800 * 1024) // Лимит 1.8 МБ для безопасного хранения во Flash
 
 HardwareSerial RTKSerial(2);
 SFE_UBLOX_GNSS_SERIAL myGNSS;
@@ -35,11 +39,11 @@ String casterMount  = MOUNTPOINT;
 String casterPass   = SOURCE_PASSWORD;
 
 bool useFixedBase   = false;
-bool balconyFilter  = true;           // true = Фильтр переотражений для балкона (15 град / 22 dBHz)
+bool balconyFilter  = true;           // Срез переотражений балкона (15 град / 22 dBHz)
 double fixedLatDeg  = 52.1115330;     // Пинск
 double fixedLonDeg  = 26.1004610;
-double fixedHeightM = 145.000;        // Базовая высота эллипсоида
-double antennaHOffset = 0.045;        // Поправка фазового центра ARP -> APC (45 мм для ANT-B10)
+double fixedHeightM = 145.000;
+double antennaHOffset = 0.045;        // ARP -> APC (+45 мм для ANT-B10)
 uint32_t svinMinDur = 300;
 float svinAccLimitM = 2.00;
 
@@ -50,8 +54,8 @@ uint32_t last5SecBytes = 0;
 uint8_t currentSIV = 0;
 uint8_t currentFixType = 0;
 float currentPDOP = 1.1f;
-float currentHAccMM = 12.0f;          // Горизонтальная оценка точности (мм)
-float currentVAccMM = 18.0f;          // Вертикальная оценка точности (мм)
+float currentHAccMM = 10.0f;
+float currentVAccMM = 15.0f;
 double liveLatDeg = 52.1115330;
 double liveLonDeg = 26.1004610;
 double liveHeightM = 145.000;
@@ -61,7 +65,33 @@ uint32_t svinObsTime = 300;
 float svinMeanAcc = 0.005f;
 bool f9pConnected = false;
 
-// === Счетчики пакетов RTCM3 (Инспектор потока) ===
+// === 1. Математическое ядро «Умной Статики» (Взвешенный фильтр Виссельфорда + 3-сигма) ===
+bool smartStaticActive = true;
+uint32_t smartEpochsAccepted = 0;
+uint32_t smartEpochsRejected = 0;
+double smartWeightSum = 0.0;
+double smartMeanLat   = 52.1115330;
+double smartMeanLon   = 26.1004610;
+double smartMeanHgt   = 145.000;
+double smartM2Lat     = 0.0;
+double smartM2Lon     = 0.0;
+double smartRmsMM     = 0.0;          // Оценка сходимости центра в миллиметрах
+
+// === 2. PPK Логгер статики во внутреннюю флеш-память LittleFS ===
+bool fsMounted = false;
+bool isLoggingStatic = false;
+File staticLogFile;
+uint32_t loggedBytesTotal = 0;
+
+// === 3. Обратный канал от полевого ровера EFT M4 (NMEA $GPGGA) ===
+String roverStatusText = "Нет данных GGA";
+double roverLatDeg = 0.0;
+double roverLonDeg = 0.0;
+float roverBaselineKM = 0.0f;
+uint8_t roverSats = 0;
+uint32_t lastRoverGgaTime = 0;
+
+// === Счетчики пакетов RTCM3 ===
 uint32_t cnt1005 = 0, cnt1077 = 0, cnt1087 = 0, cnt1097 = 0, cnt1127 = 0, cnt1230 = 0;
 
 // === Монитор ВЧ-помех и антенны ===
@@ -69,7 +99,7 @@ uint16_t noisePer = 0;
 uint8_t jammerState = 0;
 String antennaStatus = "OK";
 
-// === Структура спутников (с азимутом и углом возвышения для Skyplot) ===
+// === Структура спутников ===
 struct SatInfo {
   char sysChar;
   uint8_t svId;
@@ -83,6 +113,121 @@ SatInfo satList[MAX_DISPLAY_SATS];
 uint8_t satsInView = 0;
 uint8_t satsInUse  = 0;
 float avgSnr       = 0.0f;
+
+// Сброс накопителя «Умной Статики»
+void resetSmartStatic() {
+  smartEpochsAccepted = 0;
+  smartEpochsRejected = 0;
+  smartWeightSum = 0.0;
+  smartM2Lat = 0.0;
+  smartM2Lon = 0.0;
+  smartRmsMM = 0.0;
+}
+
+// Добавление новой эпохи в фильтр «Умной Статики» с отсевом выбросов 3-сигма
+void feedSmartStaticEpoch(double lat, double lon, double hgt, float pdop, float hAccMM) {
+  if (!smartStaticActive) return;
+
+  // Жесткий геодезический фильтр качества эпохи
+  if (pdop > 1.6f || avgSnr < 28.0f || currentSIV < 16 || hAccMM > 1500.0f) {
+    smartEpochsRejected++;
+    return;
+  }
+
+  // Перевод разницы в метры для проверки 3-сигма (после первых 30 эпох прогрева)
+  if (smartEpochsAccepted > 30) {
+    double dLatM = (lat - smartMeanLat) * 111320.0;
+    double dLonM = (lon - smartMeanLon) * 111320.0 * cos(smartMeanLat * DEG_TO_RAD);
+    double distMM = sqrt(dLatM * dLatM + dLonM * dLonM) * 1000.0;
+
+    // Отбрасываем аномальные скачки от переотражений балкона (> 3 сигма или > 800 мм)
+    double thresholdMM = max(800.0, smartRmsMM * 3.5 * sqrt((double)smartEpochsAccepted));
+    if (distMM > thresholdMM) {
+      smartEpochsRejected++;
+      return;
+    }
+  }
+
+  // Вес эпохи обратно пропорционален квадрату PDOP и оценке погрешности
+  double weight = 1.0 / (max(0.5f, pdop * pdop) * max(5.0f, hAccMM));
+  smartEpochsAccepted++;
+
+  if (smartEpochsAccepted == 1) {
+    smartWeightSum = weight;
+    smartMeanLat = lat;
+    smartMeanLon = lon;
+    smartMeanHgt = hgt;
+    smartRmsMM = hAccMM;
+  } else {
+    double newWeightSum = smartWeightSum + weight;
+    double deltaLat = lat - smartMeanLat;
+    double deltaLon = lon - smartMeanLon;
+    double deltaHgt = hgt - smartMeanHgt;
+
+    smartMeanLat += (weight / newWeightSum) * deltaLat;
+    smartMeanLon += (weight / newWeightSum) * deltaLon;
+    smartMeanHgt += (weight / newWeightSum) * deltaHgt;
+
+    // Накопление дисперсии в метрах
+    double dLatM = deltaLat * 111320.0;
+    double dLonM = deltaLon * 111320.0 * cos(smartMeanLat * DEG_TO_RAD);
+    smartM2Lat += weight * dLatM * dLatM;
+    smartM2Lon += weight * dLonM * dLonM;
+    smartWeightSum = newWeightSum;
+
+    // СКО сходимости математического ожидания центра (в мм)
+    double varM2 = (smartM2Lat + smartM2Lon) / smartWeightSum;
+    smartRmsMM = (sqrt(varM2) * 1000.0) / sqrt((double)smartEpochsAccepted);
+  }
+}
+
+// Разбор обратной строки NMEA $GPGGA / $GNGGA от полевого ровера EFT M4
+double parseNmeaCoord(const String &val, const String &hem) {
+  if (val.length() < 4) return 0.0;
+  int dotIdx = val.indexOf('.');
+  if (dotIdx < 2) return 0.0;
+  double deg = val.substring(0, dotIdx - 2).toDouble();
+  double mins = val.substring(dotIdx - 2).toDouble();
+  double res = deg + (mins / 60.0);
+  if (hem == "S" || hem == "W") res = -res;
+  return res;
+}
+
+void parseRoverNMEA(const String &line) {
+  if (!line.startsWith("$GPGGA") && !line.startsWith("$GNGGA")) return;
+
+  // Разбиваем строку GGA по запятым
+  int idx = 0;
+  String parts[15];
+  int start = 0;
+  for (int i = 0; i < (int)line.length() && idx < 14; i++) {
+    if (line[i] == ',' || line[i] == '*') {
+      parts[idx++] = line.substring(start, i);
+      start = i + 1;
+    }
+  }
+  if (idx < 8) return;
+
+  double rLat = parseNmeaCoord(parts[2], parts[3]);
+  double rLon = parseNmeaCoord(parts[4], parts[5]);
+  int fixQual = parts[6].toInt();
+  roverSats   = parts[7].toInt();
+
+  if (fixQual == 4) roverStatusText = "RTK FIXED (Фикс)";
+  else if (fixQual == 5) roverStatusText = "RTK FLOAT (Плавающий)";
+  else if (fixQual == 2) roverStatusText = "DGPS";
+  else if (fixQual == 1) roverStatusText = "SINGLE (Автономно)";
+  else roverStatusText = "Нет фикса";
+
+  if (rLat != 0.0 && rLon != 0.0) {
+    roverLatDeg = rLat;
+    roverLonDeg = rLon;
+    double dLatM = (roverLatDeg - fixedLatDeg) * 111320.0;
+    double dLonM = (roverLonDeg - fixedLonDeg) * 111320.0 * cos(fixedLatDeg * DEG_TO_RAD);
+    roverBaselineKM = sqrt(dLatM * dLatM + dLonM * dLonM) / 1000.0f;
+    lastRoverGgaTime = millis();
+  }
+}
 
 // 1. Загрузка и сохранение настроек
 void loadSettings() {
@@ -140,7 +285,6 @@ uint8_t getActiveRoverCount() {
   return count;
 }
 
-// Анализ заголовка кадра RTCM3 (12-битный номер сообщения)
 void inspectRtcmPacket(const uint8_t *buf, size_t len) {
   if (len < 6) return;
   uint16_t msgType = ((uint16_t)buf[3] << 4) | ((buf[4] >> 4) & 0x0F);
@@ -157,6 +301,17 @@ void broadcastRTCM(const uint8_t *data, size_t len) {
   rtcmBytesGenerated += len;
   inspectRtcmPacket(data, len);
 
+  // Запись в файл PPK статики во Flash-память (если включен логгер)
+  if (isLoggingStatic && fsMounted && staticLogFile) {
+    if (loggedBytesTotal + len < MAX_LOG_SIZE_BYTES) {
+      staticLogFile.write(data, len);
+      loggedBytesTotal += len;
+    } else {
+      staticLogFile.close();
+      isLoggingStatic = false;
+    }
+  }
+
   for (int i = 0; i < MAX_LOCAL_CLIENTS; i++) {
     if (localRoverClients[i] && localRoverClients[i].connected()) {
       localRoverClients[i].write(data, len);
@@ -167,13 +322,12 @@ void broadcastRTCM(const uint8_t *data, size_t len) {
   }
 }
 
-// 2. Применение координат и фильтра многолучевости (Балкон / Крыша)
+// 2. Применение координат и фильтра многолучевости
 bool applyBaseModeToF9P() {
   if (!f9pConnected) return false;
 
   myGNSS.newCfgValset(VAL_LAYER_RAM_BBR);
 
-  // Профиль фильтрации переотражений: Балкон (15 град / 22 dBHz) или Крыша (10 град / 15 dBHz)
   uint8_t minElev = balconyFilter ? 15 : 10;
   uint8_t minCno  = balconyFilter ? 22 : 15;
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINELEV, minElev);
@@ -223,6 +377,10 @@ void onPVTData(UBX_NAV_PVT_data_t *pvt) {
   liveLatDeg = pvt->lat / 1e7;
   liveLonDeg = pvt->lon / 1e7;
   liveHeightM = pvt->height / 1000.0;
+
+  if (currentFixType >= 3) {
+    feedSmartStaticEpoch(liveLatDeg, liveLonDeg, liveHeightM, currentPDOP, currentHAccMM);
+  }
 }
 
 void onSVINData(UBX_NAV_SVIN_data_t *svin) {
@@ -286,7 +444,7 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
   avgSnr     = (snrCount > 0) ? ((float)snrSum / snrCount) : 0.0f;
 }
 
-// Демо-симулятор спутников (работает автоматически, пока ZED-F9P не подключен)
+// Демо-симулятор (пока ZED-F9P в пути)
 void runDemoSimulator() {
   static uint32_t lastSimTick = 0;
   if (millis() - lastSimTick < 1000) return;
@@ -297,11 +455,9 @@ void runDemoSimulator() {
   currentSIV = 36;
   satsInView = 42;
   satsInUse = 36;
-  currentPDOP = 1.1f;
-  currentHAccMM = 8.5f;
-  currentVAccMM = 14.2f;
+  currentPDOP = 1.05f;
+  currentHAccMM = 9.0f;
 
-  // Имитируем счетчики пакетов в демо-режиме
   cnt1005++; cnt1077++; cnt1087++; cnt1097++; cnt1127++;
   if ((cnt1077 % 5) == 0) cnt1230++;
 
@@ -318,9 +474,13 @@ void runDemoSimulator() {
     snrSum += satList[i].cno;
   }
   avgSnr = snrSum / 28.0f;
+
+  // Имитация работы фильтра Умной Статики в демо-режиме
+  double jitterLat = ((int)(millis() % 100) - 50) * 1e-8;
+  double jitterLon = ((int)((millis() / 7) % 100) - 50) * 1e-8;
+  feedSmartStaticEpoch(52.1115330 + jitterLat, 26.1004610 + jitterLon, 145.000, currentPDOP, currentHAccMM);
 }
 
-// Прямой парсер UBX-MON-RF
 void parseRawUBXByte(uint8_t b) {
   static uint8_t ubxState = 0;
   static uint8_t msgClass = 0, msgId = 0;
@@ -408,15 +568,13 @@ void processUARTStream() {
   myGNSS.checkCallbacks();
 }
 
-// 4. Инициализация сети с отключением энергосбережения Wi-Fi (минимальный пинг и джиттер)
+// 4. Инициализация сети
 void initNetwork() {
   WiFi.persistent(false);
   WiFi.disconnect(true);
   delay(100);
 
   WiFi.mode(WIFI_AP_STA);
-
-  // Отключаем засыпание Wi-Fi модуля для мгновенной отправки пакетов RTCM3 без задержек
   esp_wifi_set_ps(WIFI_PS_NONE);
 
   wifi_country_t country = {
@@ -464,21 +622,75 @@ void initNetwork() {
 
   MDNS.begin(OTA_HOSTNAME);
   localNtripServer.begin();
-  localNtripServer.setNoDelay(true); // Мгновенная отдача TCP-кадров без буферизации Нейгла
+  localNtripServer.setNoDelay(true);
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.begin();
 }
 
-// 5. Веб-интерфейс v1.7.0 (Ultra-Precision Edition)
+// 5. Веб-интерфейс v1.8.0 (Умная Статика + PPK Логгер + Контроль Ровера)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
+
+  // Скачивание записанного файла статики (.rtcm3) для постобработки PPK / RINEX
+  webServer.on("/download_static", HTTP_GET, []() {
+    if (!fsMounted || !LittleFS.exists(STATIC_LOG_FILE)) {
+      webServer.send(404, "text/plain", "Log file not found");
+      return;
+    }
+    File f = LittleFS.open(STATIC_LOG_FILE, "r");
+    webServer.sendHeader("Content-Disposition", "attachment; filename=pinsk_base_static.rtcm3");
+    webServer.streamFile(f, "application/octet-stream");
+    f.close();
+  });
+
+  webServer.on("/toggle_log", HTTP_POST, []() {
+    if (fsMounted) {
+      if (!isLoggingStatic) {
+        staticLogFile = LittleFS.open(STATIC_LOG_FILE, "a");
+        if (staticLogFile) {
+          loggedBytesTotal = staticLogFile.size();
+          isLoggingStatic = true;
+        }
+      } else {
+        if (staticLogFile) staticLogFile.close();
+        isLoggingStatic = false;
+      }
+    }
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  });
+
+  webServer.on("/clear_log", HTTP_POST, []() {
+    if (fsMounted) {
+      if (isLoggingStatic && staticLogFile) staticLogFile.close();
+      isLoggingStatic = false;
+      LittleFS.remove(STATIC_LOG_FILE);
+      loggedBytesTotal = 0;
+    }
+    resetSmartStatic();
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  });
+
+  webServer.on("/apply_smart", HTTP_POST, []() {
+    if (smartEpochsAccepted > 0) {
+      fixedLatDeg = smartMeanLat;
+      fixedLonDeg = smartMeanLon;
+      fixedHeightM = smartMeanHgt;
+      antennaHOffset = 0.0;
+      useFixedBase = true;
+      saveSettings();
+      applyBaseModeToF9P();
+    }
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  });
 
   webServer.on("/api/status", HTTP_GET, []() {
     String fixText = !f9pConnected ? "DEMO (Симулятор)" :
                      (currentFixType == 5) ? "TIME (БАЗА АКТИВНА)" :
                      (currentFixType == 3) ? "3D Fix" : "Поиск неба";
-    String svinText = svinValid ? "ГОТОВО" : (svinActive ? "Накопление..." : "Fixed Mode");
     String netInfo = isApMode ? ("AP: " + String(AP_SSID) + " (192.168.4.1)") :
                                 (wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
@@ -487,14 +699,15 @@ void setupWebMonitor() {
     char uptimeStr[32];
     sprintf(uptimeStr, "%luч %02luм", uptimeSec / 3600, (uptimeSec % 3600) / 60);
 
-    // Расчет 3D-отклонения текущих координат от записанных Fixed (в миллиметрах)
-    double dLatM = (liveLatDeg - fixedLatDeg) * 111320.0;
-    double dLonM = (liveLonDeg - fixedLonDeg) * 111320.0 * cos(fixedLatDeg * DEG_TO_RAD);
-    double driftMM = sqrt(dLatM * dLatM + dLonM * dLonM) * 1000.0;
-    if (!f9pConnected) driftMM = 2.4;
-
     String rtcmStat = "1005:" + String(cnt1005) + " | G:" + String(cnt1077) +
                       " R:" + String(cnt1087) + " E:" + String(cnt1097) + " B:" + String(cnt1127);
+
+    String smartCoords = String(smartMeanLat, 8) + ", " + String(smartMeanLon, 8) + " (" + String(smartMeanHgt, 3) + "м)";
+    String smartStat   = "±" + String(smartRmsMM, 1) + " мм (Принято: " + String(smartEpochsAccepted) + " / Отсев: " + String(smartEpochsRejected) + ")";
+
+    bool roverOnline = (lastRoverGgaTime > 0 && (millis() - lastRoverGgaTime < 15000));
+    String rvrInfo = roverOnline ? (roverStatusText + " | Базовая линия: " + String(roverBaselineKM, 2) + " км") :
+                                   "Ожидание строки $GPGGA от контроллера EFT H3...";
 
     String json = "{";
     json += "\"f9p\":" + String(f9pConnected ? "true" : "false") + ",";
@@ -508,10 +721,12 @@ void setupWebMonitor() {
     json += "\"antStat\":\"" + antennaStatus + "\",";
     json += "\"temp\":\"" + String(cpuTemp, 1) + "°C\",";
     json += "\"uptime\":\"" + String(uptimeStr) + "\",";
-    json += "\"drift\":\"" + String(driftMM, 1) + " мм\",";
     json += "\"rtcmStat\":\"" + rtcmStat + "\",";
-    json += "\"svinText\":\"" + svinText + " (" + String(svinObsTime) + "с / " + String(svinMeanAcc, 2) + "м)\",";
-    json += "\"liveCoords\":\"" + String(liveLatDeg, 7) + ", " + String(liveLonDeg, 7) + " (" + String(liveHeightM, 2) + "м)\",";
+    json += "\"smartCoords\":\"" + smartCoords + "\",";
+    json += "\"smartStat\":\"" + smartStat + "\",";
+    json += "\"logActive\":" + String(isLoggingStatic ? "true" : "false") + ",";
+    json += "\"logKB\":\"" + String(loggedBytesTotal / 1024.0f, 1) + " КБ\",";
+    json += "\"rvrInfo\":\"" + rvrInfo + "\",";
     json += "\"rovers\":" + String(getActiveRoverCount()) + ",";
     json += "\"bytes\":" + String(last5SecBytes) + ",";
     json += "\"net\":\"" + netInfo + "\",";
@@ -540,14 +755,14 @@ void setupWebMonitor() {
       "<style>"
       "body{font-family:-apple-system,sans-serif;background:#0b0e14;color:#eee;margin:0;padding:10px;}"
       ".card{background:#151922;padding:14px;border-radius:12px;max-width:500px;margin:0 auto 12px;border:1px solid #262c3a;box-shadow:0 4px 12px rgba(0,0,0,0.5);}"
-      "h2,h3{margin-top:0;color:#64b5f6;font-size:18px;}"
+      "h2,h3{margin-top:0;color:#64b5f6;font-size:17px;}"
       ".top-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;}"
       ".stat-box{background:#090b10;border:1px solid #2c3344;border-radius:8px;padding:10px;}"
-      ".stat-title{font-size:12px;color:#9aa0a6;}"
-      ".stat-val{font-size:18px;font-weight:bold;margin-top:4px;}"
+      ".stat-title{font-size:11px;color:#9aa0a6;}"
+      ".stat-val{font-size:17px;font-weight:bold;margin-top:4px;}"
       ".sky-panel{background:#050826;border:1px solid #2b3358;border-radius:10px;padding:12px;margin-bottom:10px;}"
       ".sky-counts{display:flex;justify-content:space-between;margin-bottom:6px;}"
-      ".bars-wrap{display:flex;align-items:flex-end;gap:4px;height:130px;overflow-x:auto;padding-top:16px;border-bottom:1px solid #394264;}"
+      ".bars-wrap{display:flex;align-items:flex-end;gap:4px;height:125px;overflow-x:auto;padding-top:16px;border-bottom:1px solid #394264;}"
       ".bar-col{display:flex;flex-direction:column;align-items:center;min-width:24px;}"
       ".bar-val{font-size:10px;color:#fff;margin-bottom:2px;}"
       ".bar-fill{width:18px;border-radius:3px 3px 0 0;transition:height 0.3s;}"
@@ -558,9 +773,10 @@ void setupWebMonitor() {
       ".row{display:flex;justify-content:space-between;margin:7px 0;border-bottom:1px solid #222733;padding-bottom:5px;font-size:13px;}"
       "label{display:block;margin-top:10px;font-size:12px;color:#aaa;}"
       "input,select{width:100%;padding:9px;margin-top:4px;background:#202634;border:1px solid #384152;color:#fff;border-radius:6px;box-sizing:border-box;font-size:14px;}"
-      ".btn{display:block;width:100%;padding:11px;margin-top:10px;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box;}"
+      ".btn{display:block;width:100%;padding:10px;margin-top:8px;border:none;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box;}"
       ".btn-save{background:#2e7d32;color:#fff;}"
       ".btn-copy{background:#1565c0;color:#fff;}"
+      ".btn-warn{background:#c62828;color:#fff;}"
       ".btn-preset{background:#37474f;color:#fff;width:48%;display:inline-block;margin-top:6px;}"
       ".btn-refresh{background:#303644;color:#fff;}"
       "</style>"
@@ -606,14 +822,16 @@ void setupWebMonitor() {
       "let fixEl = document.getElementById('s_fix');"
       "fixEl.innerText = d.fixText;"
       "fixEl.style.color = (d.f9p ? '#00e676' : '#ffea00');"
-      "document.getElementById('s_pdop').innerText = d.pdop + ' (' + d.drift + ')';"
+      "document.getElementById('s_pdop').innerText = d.pdop;"
       "document.getElementById('s_view').innerText = d.inView;"
       "document.getElementById('s_use').innerText = d.inUse;"
       "document.getElementById('s_ant').innerText = d.antStat;"
       "document.getElementById('s_temp').innerText = d.temp + ' / ' + d.uptime;"
-      "document.getElementById('s_svin').innerText = d.svinText;"
-      "document.getElementById('s_coords').innerText = d.liveCoords;"
       "document.getElementById('s_rtcm').innerText = d.rtcmStat;"
+      "document.getElementById('s_smart_c').innerText = d.smartCoords;"
+      "document.getElementById('s_smart_s').innerText = d.smartStat;"
+      "document.getElementById('s_log_kb').innerText = d.logKB + (d.logActive ? ' (ЗАПИСЬ...)' : ' (Стоп)');"
+      "document.getElementById('s_rvr').innerText = d.rvrInfo;"
       "document.getElementById('s_rovers').innerText = d.rovers+' шт.';"
       "document.getElementById('s_bytes').innerText = d.bytes+' байт';"
       "document.getElementById('s_net').innerText = d.net;"
@@ -621,9 +839,7 @@ void setupWebMonitor() {
       "document.getElementById('snr_val').innerText = avg.toFixed(1);"
       "document.getElementById('snr_pin').style.left = Math.min(Math.max(avg, 5), 95) + '%';"
       "let bw = document.getElementById('bars');"
-      "if(!d.sats || d.sats.length === 0){"
-      "bw.innerHTML = '<div style=\"margin:auto;color:#6c7593;font-size:13px;\">Ожидание спутников...</div>';"
-      "}else{"
+      "if(d.sats && d.sats.length > 0){"
       "let h = '';"
       "d.sats.forEach(s=>{"
       "let px = Math.min(Math.max(s.cno * 2.2, 6), 110);"
@@ -643,35 +859,55 @@ void setupWebMonitor() {
       "window.onload = updateUI;"
       "</script></head><body>"
 
+      // Карточка 1: Спектр и радар
       "<div class='card'>"
       "<h2>🛰️ RTK База v" FW_VERSION " (" + String(LOCAL_MOUNTPOINT) + ")</h2>"
       "<div class='top-grid'>"
       "<div class='stat-box'><div class='stat-title'>Статус GNSS</div><div id='s_fix' class='stat-val' style='font-size:14px;'>Загрузка...</div></div>"
-      "<div class='stat-box'><div class='stat-title'>PDOP / Дрейф базы</div><div id='s_pdop' class='stat-val' style='font-size:15px;color:#00e5ff;'>-</div></div>"
+      "<div class='stat-box'><div class='stat-title'>PDOP (Геометрия)</div><div id='s_pdop' class='stat-val' style='color:#00e5ff;'>-</div></div>"
       "<div class='stat-box'><div class='stat-title'>Антенна (ANT-B10)</div><div id='s_ant' class='stat-val' style='font-size:15px;color:#76ff03;'>-</div></div>"
       "<div class='stat-box'><div class='stat-title'>CPU / Uptime</div><div id='s_temp' class='stat-val' style='font-size:14px;color:#ffea00;'>-</div></div>"
       "</div>"
 
       "<div class='sky-panel'>"
       "<div class='sky-counts'>"
-      "<div><div class='stat-title'>В поле зрения: <b id='s_view' style='color:#fff;font-size:16px;'>0</b></div></div>"
-      "<div style='text-align:right;'><div class='stat-title'>В решении RTK: <b id='s_use' style='color:#76ff03;font-size:16px;'>0</b></div></div>"
+      "<div><div class='stat-title'>В поле зрения: <b id='s_view' style='color:#fff;font-size:15px;'>0</b></div></div>"
+      "<div style='text-align:right;'><div class='stat-title'>В решении RTK: <b id='s_use' style='color:#76ff03;font-size:15px;'>0</b></div></div>"
       "</div>"
-      "<canvas id='skyplot' width='210' height='210' style='margin:4px auto;display:block;'></canvas>"
+      "<canvas id='skyplot' width='200' height='200' style='margin:4px auto;display:block;'></canvas>"
       "<div id='bars' class='bars-wrap'></div>"
       "<div style='margin-top:10px;font-size:11px;color:#9aa0a6;'>AVG SNR (Средний уровень сигнала, dBHz):</div>"
       "<div class='snr-bar'><div id='snr_pin' class='snr-pin' style='left:30%;'><span id='snr_val'>0.0</span></div></div>"
       "</div>"
 
-      "<div class='row'><span>Фильтр многолучевости:</span><b>" + String(balconyFilter ? "БАЛКОН (15° / 22 dBHz)" : "КРЫША (10° / 15 dBHz)") + "</b></div>"
-      "<div class='row'><span>Survey-In:</span><b id='s_svin'>-</b></div>"
-      "<div class='row'><span>Текущие WGS-84:</span><b id='s_coords'>-</b></div>"
       "<div class='row'><span>Инспектор RTCM3:</span><b id='s_rtcm' style='font-size:11px;color:#80cbc4;'>-</b></div>"
       "<div class='row'><span>Роверов (Порт " + String(LOCAL_NTRIP_PORT) + "):</span><b id='s_rovers'>0 шт.</b></div>"
+      "<div class='row'><span>Контроль ровера (GGA):</span><b id='s_rvr' style='font-size:11px;color:#00e676;'>-</b></div>"
       "<div class='row'><span>Поток RTCM3 (5с):</span><b id='s_bytes'>0 байт</b></div>"
       "<div class='row'><span>Сеть:</span><b id='s_net' style='font-size:12px;'>" + WiFi.localIP().toString() + "</b></div>"
       "</div>"
 
+      // Карточка 2: Умный прием статики и PPK логгер во Flash
+      "<div class='card'>"
+      "<h3>🧠 Умный прием статики (Фильтр 3σ + PPK Логгер)</h3>"
+      "<div class='row'><span>Взвешенный центр:</span><b id='s_smart_c' style='font-size:12px;color:#00e5ff;'>-</b></div>"
+      "<div class='row'><span>Сходимость центра:</span><b id='s_smart_s' style='font-size:12px;color:#76ff03;'>-</b></div>"
+      "<div class='row'><span>Лог статики во Flash:</span><b id='s_log_kb' style='color:#ffea00;'>0 КБ</b></div>"
+      "<form action='/apply_smart' method='POST'>"
+      "<button type='submit' class='btn btn-copy'>🎯 Зафиксировать умный центр в FIXED</button>"
+      "</form>"
+      "<div style='display:flex;gap:6px;'>"
+      "<form action='/toggle_log' method='POST' style='width:50%;'>"
+      "<button type='submit' class='btn btn-save'>⏺ Старт / Стоп записи PPK</button>"
+      "</form>"
+      "<a href='/download_static' class='btn btn-refresh' style='width:50%;'>📥 Скачать .rtcm3</a>"
+      "</div>"
+      "<form action='/clear_log' method='POST'>"
+      "<button type='submit' class='btn btn-warn'>🗑 Сбросить статистику и очистить лог</button>"
+      "</form>"
+      "</div>"
+
+      // Карточка 3: Координаты и фильтр неба
       "<div class='card'>"
       "<h3>⚙️ Координаты, фильтр неба и фазовый центр</h3>"
       "<div style='display:flex;justify-content:space-between;'>"
@@ -697,18 +933,11 @@ void setupWebMonitor() {
       "<input id='hgt' type='number' step='0.0001' name='hgt' value='" + String(fixedHeightM, 4) + "' required>"
       "<label>Поправка фазового центра ARP ➔ APC (м):</label>"
       "<input type='number' step='0.001' name='ant_off' value='" + String(antennaHOffset, 3) + "' required>"
-      "<label>Время Survey-In (сек) / Допуск (м):</label>"
-      "<div style='display:flex;gap:8px;'>"
-      "<input type='number' name='dur' value='" + String(svinMinDur) + "' required>"
-      "<input type='number' step='0.01' name='acc' value='" + String(svinAccLimitM, 2) + "' required>"
-      "</div>"
       "<button type='submit' class='btn btn-save'>💾 Применить настройки в ZED-F9P</button>"
-      "</form>"
-      "<form action='/use_current' method='POST'>"
-      "<button type='submit' class='btn btn-copy'>🎯 Зафиксировать текущие с неба в FIXED</button>"
       "</form>"
       "</div>"
 
+      // Карточка 4: Сеть
       "<div class='card'>"
       "<h3>🌐 Сеть Wi-Fi и Кастер</h3>"
       "<form action='/save_net' method='POST'>"
@@ -746,25 +975,9 @@ void setupWebMonitor() {
     if (webServer.hasArg("lon"))     fixedLonDeg    = webServer.arg("lon").toDouble();
     if (webServer.hasArg("hgt"))     fixedHeightM   = webServer.arg("hgt").toDouble();
     if (webServer.hasArg("ant_off")) antennaHOffset = webServer.arg("ant_off").toDouble();
-    if (webServer.hasArg("dur"))     svinMinDur     = webServer.arg("dur").toInt();
-    if (webServer.hasArg("acc"))     svinAccLimitM  = webServer.arg("acc").toFloat();
 
     saveSettings();
     applyBaseModeToF9P();
-    webServer.sendHeader("Location", "/");
-    webServer.send(303);
-  });
-
-  webServer.on("/use_current", HTTP_POST, []() {
-    if (liveLatDeg != 0.0 && liveLonDeg != 0.0) {
-      fixedLatDeg = liveLatDeg;
-      fixedLonDeg = liveLonDeg;
-      fixedHeightM = liveHeightM;
-      antennaHOffset = 0.0;
-      useFixedBase = true;
-      saveSettings();
-      applyBaseModeToF9P();
-    }
     webServer.sendHeader("Location", "/");
     webServer.send(303);
   });
@@ -787,12 +1000,24 @@ void setupWebMonitor() {
   webServer.begin();
 }
 
+// Обработка подключений и чтение обратной строки $GPGGA от полевого контроллера EFT H3
 void handleLocalNtripClients() {
+  // Читаем входящие строки NMEA GGA от уже подключенных роверов
+  for (int i = 0; i < MAX_LOCAL_CLIENTS; i++) {
+    if (localRoverClients[i] && localRoverClients[i].connected() && localRoverClients[i].available()) {
+      String line = localRoverClients[i].readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("$G")) {
+        parseRoverNMEA(line);
+      }
+    }
+  }
+
   if (!localNtripServer.hasClient()) return;
 
   WiFiClient newClient = localNtripServer.accept();
   if (!newClient) return;
-  newClient.setNoDelay(true); // Отключаем задержку TCP для минимального Age of Differential
+  newClient.setNoDelay(true);
 
   unsigned long timeout = millis();
   while (!newClient.available() && millis() - timeout < 1500) delay(5);
@@ -807,7 +1032,7 @@ void handleLocalNtripClients() {
     String sourceTable = 
       "SOURCETABLE 200 OK\r\nContent-Type: text/plain\r\n\r\n"
       "STR;" + String(LOCAL_MOUNTPOINT) + ";Pinsk;RTCM 3.3;1005(1),1006(5),1033(10),1077(1),1087(1),1097(1),1127(1),1230(5);2;GPS+GLO+GAL+BDS;LOCAL;BLR;" +
-      String(fixedLatDeg, 2) + ";" + String(fixedLonDeg, 2) + ";0;0;ESP32-F9P;none;N;N;9600;\r\nENDSOURCETABLE\r\n";
+      String(fixedLatDeg, 2) + ";" + String(fixedLonDeg, 2) + ";1;0;ESP32-F9P;none;N;N;9600;\r\nENDSOURCETABLE\r\n";
     newClient.print(sourceTable);
     delay(50);
     newClient.stop();
@@ -826,7 +1051,7 @@ void handleLocalNtripClients() {
 }
 
 bool configureF9PBase() {
-  RTKSerial.setRxBufferSize(8192); // Увеличенный аппаратный буфер DMA (8 КБ)
+  RTKSerial.setRxBufferSize(8192);
   RTKSerial.begin(460800, SERIAL_8N1, RXD2, TXD2);
 
   if (!myGNSS.begin(RTKSerial)) {
@@ -859,11 +1084,13 @@ bool configureF9PBase() {
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_SBAS_ENA, 0);
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_QZSS_ENA, 0);
 
-  // Стационарная геодезическая модель (2 = Stationary) и профиль среза многолучевости
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_DYNMODEL, 2);
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINELEV, (uint8_t)(balconyFilter ? 15 : 10));
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINCNO, (uint8_t)(balconyFilter ? 22 : 15));
   myGNSS.addCfgValset(UBLOX_CFG_RATE_MEAS, 1000);
+
+  // Компенсация задержки сигнала в 5-метровом коаксиальном кабеле RG-58 (25 наносекунд = 0x30050001)
+  myGNSS.addCfgValset((uint32_t)0x30050001, (uint16_t)25);
 
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_NMEA, 0);
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_RTCM3X, 1);
@@ -871,8 +1098,7 @@ bool configureF9PBase() {
 
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1005_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1006_UART1, 5);
-  // Прямая бинарная инъекция ключа RTCM 1033 (Receiver & Antenna Description на UART1 = 0x20910319)
-  myGNSS.addCfgValset((uint32_t)0x20910319, (uint8_t)10);
+  myGNSS.addCfgValset((uint32_t)0x20910319, (uint8_t)10); // RTCM 1033
 
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1077_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1087_UART1, 1);
@@ -914,33 +1140,52 @@ bool connectCloudCaster() {
   return false;
 }
 
+// Выделенная задача на Ядре 0 (Core 0) для мгновенной прокачки UART -> RTCM3 без задержек от веб-интерфейса
+void gnssStreamTask(void *pvParameters) {
+  uint32_t lastF9PCheck = 0;
+  for (;;) {
+    if (f9pConnected) {
+      processUARTStream();
+    } else {
+      runDemoSimulator();
+      if (millis() - lastF9PCheck > 10000) {
+        lastF9PCheck = millis();
+        configureF9PBase();
+      }
+    }
+    vTaskDelay(1); // Минимальная уступка планировщику (1 мс)
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Монтируем файловую систему LittleFS во встроенной флеш-памяти для записи статики PPK
+  if (LittleFS.begin(true)) {
+    fsMounted = true;
+    if (LittleFS.exists(STATIC_LOG_FILE)) {
+      File f = LittleFS.open(STATIC_LOG_FILE, "r");
+      if (f) { loggedBytesTotal = f.size(); f.close(); }
+    }
+  }
+
   loadSettings();
   initNetwork();
   setupWebMonitor();
   configureF9PBase();
+
+  // Закрепляем поток реального времени GNSS на Ядре 0 (а веб-сервер остается на Ядре 1)
+  xTaskCreatePinnedToCore(gnssStreamTask, "GNSS_RTCM_Task", 8192, NULL, 2, NULL, 0);
 }
 
 void loop() {
   static uint32_t lastReportTime = 0;
   static uint32_t lastReconnectAttempt = 0;
-  static uint32_t lastF9PCheck = 0;
 
   ArduinoOTA.handle();
   webServer.handleClient();
   handleLocalNtripClients();
-
-  if (f9pConnected) {
-    processUARTStream();
-  } else {
-    runDemoSimulator();
-    if (millis() - lastF9PCheck > 10000) {
-      lastF9PCheck = millis();
-      configureF9PBase();
-    }
-  }
 
   if (millis() - lastReconnectAttempt > 5000) {
     lastReconnectAttempt = millis();
@@ -957,12 +1202,11 @@ void loop() {
     last5SecBytes = rtcmBytesGenerated;
     rtcmBytesGenerated = 0;
 
-    Serial.printf("[v%s] Режим: %s | Спутников: %2u | SNR: %.1f | Антенна: %s | RTCM3: %lu Б/5с | IP: %s\n",
+    Serial.printf("[v%s] Режим: %s | Умная статика: ±%.1f мм (%lu эп) | RTCM3: %lu Б/5с | IP: %s\n",
                   FW_VERSION,
                   f9pConnected ? "ZED-F9P" : "DEMO",
-                  currentSIV,
-                  avgSnr,
-                  antennaStatus.c_str(),
+                  smartRmsMM,
+                  (unsigned long)smartEpochsAccepted,
                   (unsigned long)last5SecBytes,
                   isApMode ? "192.168.4.1" : WiFi.localIP().toString().c_str());
   }
