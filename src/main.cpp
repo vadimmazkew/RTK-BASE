@@ -9,16 +9,11 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.6.1"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
 #define MAX_DISPLAY_SATS  48
-
-// Встроенный датчик температуры ESP32-S3
-extern "C" {
-  uint8_t temprature_sens_read();
-}
 
 HardwareSerial RTKSerial(2);
 SFE_UBLOX_GNSS_SERIAL myGNSS;
@@ -43,7 +38,7 @@ bool useFixedBase   = false;
 double fixedLatDeg  = 52.1115330;     // Пинск
 double fixedLonDeg  = 26.1004610;
 double fixedHeightM = 145.000;        // Базовая высота эллипсоида
-double antennaHOffset = 0.045;        // Геодезическая поправка фазового центра ARP -> APC (45 мм)
+double antennaHOffset = 0.045;        // Поправка фазового центра ARP -> APC (45 мм)
 uint32_t svinMinDur = 300;
 float svinAccLimitM = 2.00;
 
@@ -247,33 +242,45 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
     }
   }
 
+  for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t j = i + 1; j < count; j++) {
+      if (satList[j].cno > satList[i].cno) {
+        SatInfo tmp = satList[i];
+        satList[i] = satList[j];
+        satList[j] = tmp;
+      }
+    }
+  }
+
   satsInView = total;
   satsInUse  = usedCount;
   avgSnr     = (snrCount > 0) ? ((float)snrSum / snrCount) : 0.0f;
 }
 
-// Демо-симулятор спутников (если ZED-F9P еще не подключен)
+// Демо-симулятор спутников (работает автоматически, пока ZED-F9P не подключен)
 void runDemoSimulator() {
   f9pConnected = false;
-  currentFixType = 5; // TIME FIX
+  currentFixType = 5;
   currentSIV = 36;
   satsInView = 42;
   satsInUse = 36;
   currentPDOP = 1.1f;
-  avgSnr = 38.5f;
 
+  uint32_t snrSum = 0;
   for (int i = 0; i < 28; i++) {
     char sys[4] = {'G', 'R', 'E', 'B'};
     satList[i].sysChar = sys[i % 4];
-    satList[i].svId = i + 1;
-    satList[i].cno = 25 + (millis() / 1000 + i * 3) % 22;
-    satList[i].elev = 15 + (i * 7) % 70;
-    satList[i].azim = (i * 13) % 360;
-    satList[i].used = (i < 36);
+    satList[i].svId = (i % 12) + 1;
+    satList[i].cno = 24 + (millis() / 2000 + i * 5) % 24;
+    satList[i].elev = 15 + (i * 11) % 72;
+    satList[i].azim = (i * 13 + (millis() / 10000)) % 360;
+    satList[i].used = (satList[i].cno >= 28);
+    snrSum += satList[i].cno;
   }
+  avgSnr = snrSum / 28.0f;
 }
 
-// Парсер MON-RF
+// Прямой парсер UBX-MON-RF
 void parseRawUBXByte(uint8_t b) {
   static uint8_t ubxState = 0;
   static uint8_t msgClass = 0, msgId = 0;
@@ -419,7 +426,7 @@ void initNetwork() {
   ArduinoOTA.begin();
 }
 
-// 5. Веб-интерфейс v1.6.0 (Skyplot 360, Uptime, Температура ESP32-S3, Поправка высоты ARP->APC)
+// 5. Веб-интерфейс v1.6.1 (Skyplot 360, AVG SNR, Температура ESP32-S3, Поправка высоты ARP->APC)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
@@ -431,13 +438,11 @@ void setupWebMonitor() {
     String netInfo = isApMode ? ("AP: " + String(AP_SSID) + " (192.168.4.1)") :
                                 (wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
-    String jamText = (jammerState >= 2) ? "Помехи!" : "Чисто (0%)";
-    
-    // Температура чипа ESP32-S3
-    float cpuTemp = (temprature_sens_read() - 32.0) / 1.8;
+    // ИСПРАВЛЕНО для ESP32-S3: нативная функция temperatureRead()
+    float cpuTemp = temperatureRead();
     uint32_t uptimeSec = millis() / 1000;
     char uptimeStr[32];
-    sprintf(uptimeStr, "%lu ч %02lu мин", uptimeSec / 3600, (uptimeSec % 3600) / 60);
+    sprintf(uptimeStr, "%luч %02luм", uptimeSec / 3600, (uptimeSec % 3600) / 60);
 
     String json = "{";
     json += "\"f9p\":" + String(f9pConnected ? "true" : "false") + ",";
@@ -449,10 +454,9 @@ void setupWebMonitor() {
     json += "\"pdop\":\"" + String(currentPDOP, 1) + "\",";
     json += "\"avgSnr\":" + String(avgSnr, 1) + ",";
     json += "\"antStat\":\"" + antennaStatus + "\",";
-    json += "\"jamText\":\"" + jamText + "\",";
     json += "\"temp\":\"" + String(cpuTemp, 1) + "°C\",";
     json += "\"uptime\":\"" + String(uptimeStr) + "\",";
-    json += "\"svinText\":\"" + svinText + " (" + String(svinObsTime) + "с)\",";
+    json += "\"svinText\":\"" + svinText + " (" + String(svinObsTime) + "с / " + String(svinMeanAcc, 2) + "м)\",";
     json += "\"liveCoords\":\"" + String(liveLatDeg, 7) + ", " + String(liveLonDeg, 7) + " (" + String(liveHeightM, 2) + "м)\",";
     json += "\"rovers\":" + String(getActiveRoverCount()) + ",";
     json += "\"bytes\":" + String(last5SecBytes) + ",";
@@ -469,7 +473,7 @@ void setupWebMonitor() {
       json += "\"azim\":" + String(satList[i].azim) + ",";
       json += "\"used\":" + String(satList[i].used ? 1 : 0) + "}";
       outCount++;
-      if (outCount >= 36) break;
+      if (outCount >= 28) break;
     }
     json += "]}";
     webServer.send(200, "application/json", json);
@@ -486,14 +490,17 @@ void setupWebMonitor() {
       ".top-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;}"
       ".stat-box{background:#090b10;border:1px solid #2c3344;border-radius:8px;padding:10px;}"
       ".stat-title{font-size:12px;color:#9aa0a6;}"
-      ".stat-val{font-size:20px;font-weight:bold;margin-top:4px;}"
-      ".sky-panel{background:#050826;border:1px solid #2b3358;border-radius:10px;padding:12px;margin-bottom:10px;text-align:center;}"
-      ".bars-wrap{display:flex;align-items:flex-end;gap:4px;height:130px;overflow-x:auto;padding-top:14px;border-bottom:1px solid #394264;}"
+      ".stat-val{font-size:18px;font-weight:bold;margin-top:4px;}"
+      ".sky-panel{background:#050826;border:1px solid #2b3358;border-radius:10px;padding:12px;margin-bottom:10px;}"
+      ".sky-counts{display:flex;justify-content:space-between;margin-bottom:6px;}"
+      ".bars-wrap{display:flex;align-items:flex-end;gap:4px;height:130px;overflow-x:auto;padding-top:16px;border-bottom:1px solid #394264;}"
       ".bar-col{display:flex;flex-direction:column;align-items:center;min-width:24px;}"
       ".bar-val{font-size:10px;color:#fff;margin-bottom:2px;}"
       ".bar-fill{width:18px;border-radius:3px 3px 0 0;transition:height 0.3s;}"
       ".bar-dot{width:6px;height:6px;border-radius:50%;margin:4px 0 3px;}"
       ".bar-id{font-size:10px;background:#e0e0e0;color:#000;font-weight:bold;border-radius:3px;padding:1px 3px;}"
+      ".snr-bar{height:12px;border-radius:6px;background:linear-gradient(90deg,#d32f2f 0% 15%,#f57c00 15% 30%,#fbc02d 30% 50%,#64dd17 50% 100%);position:relative;margin-top:16px;}"
+      ".snr-pin{position:absolute;top:-18px;transform:translateX(-50%);background:#fbc02d;color:#000;font-size:11px;font-weight:bold;padding:1px 6px;border-radius:8px;}"
       ".row{display:flex;justify-content:space-between;margin:7px 0;border-bottom:1px solid #222733;padding-bottom:5px;font-size:13px;}"
       "label{display:block;margin-top:10px;font-size:12px;color:#aaa;}"
       "input,select{width:100%;padding:9px;margin-top:4px;background:#202634;border:1px solid #384152;color:#fff;border-radius:6px;box-sizing:border-box;font-size:14px;}"
@@ -519,24 +526,24 @@ void setupWebMonitor() {
       "let canvas = document.getElementById('skyplot');"
       "if(!canvas)return;"
       "let ctx = canvas.getContext('2d');"
-      "let cx = canvas.width/2, cy = canvas.height/2, r = cx - 15;"
+      "let cx = canvas.width/2, cy = canvas.height/2, r = cx - 16;"
       "ctx.clearRect(0,0,canvas.width,canvas.height);"
       "ctx.strokeStyle = '#2b3358'; ctx.lineWidth = 1;"
       "ctx.beginPath(); ctx.arc(cx,cy,r,0,2*Math.PI); ctx.stroke();"
       "ctx.beginPath(); ctx.arc(cx,cy,r*0.66,0,2*Math.PI); ctx.stroke();"
       "ctx.beginPath(); ctx.arc(cx,cy,r*0.33,0,2*Math.PI); ctx.stroke();"
-      "ctx.beginPath(); ctx.moveTo(cx,15); ctx.lineTo(cx,canvas.height-15); ctx.stroke();"
-      "ctx.beginPath(); ctx.moveTo(15,cy); ctx.lineTo(canvas.width-15,cy); ctx.stroke();"
-      "ctx.fillStyle = '#64b5f6'; ctx.font = '11px sans-serif';"
-      "ctx.fillText('N', cx-4, 12); ctx.fillText('S', cx-3, canvas.height-4);"
-      "ctx.fillText('W', 4, cy+4); ctx.fillText('E', canvas.width-12, cy+4);"
+      "ctx.beginPath(); ctx.moveTo(cx,16); ctx.lineTo(cx,canvas.height-16); ctx.stroke();"
+      "ctx.beginPath(); ctx.moveTo(16,cy); ctx.lineTo(canvas.width-16,cy); ctx.stroke();"
+      "ctx.fillStyle = '#64b5f6'; ctx.font = 'bold 11px sans-serif';"
+      "ctx.fillText('N', cx-4, 12); ctx.fillText('S', cx-4, canvas.height-4);"
+      "ctx.fillText('W', 3, cy+4); ctx.fillText('E', canvas.width-11, cy+4);"
       "if(!sats)return;"
       "sats.forEach(s=>{"
       "let dist = (1 - (s.elev/90)) * r;"
       "let rad = (s.azim - 90) * (Math.PI/180);"
       "let x = cx + dist * Math.cos(rad);"
       "let y = cy + dist * Math.sin(rad);"
-      "ctx.fillStyle = s.used ? '#76ff03' : '#ff9800';"
+      "ctx.fillStyle = barColor(s.cno);"
       "ctx.beginPath(); ctx.arc(x,y,4,0,2*Math.PI); ctx.fill();"
       "});"
       "}"
@@ -544,23 +551,27 @@ void setupWebMonitor() {
       "fetch('/api/status').then(r=>r.json()).then(d=>{"
       "let fixEl = document.getElementById('s_fix');"
       "fixEl.innerText = d.fixText;"
-      "fixEl.style.color = (d.fixType == 5 ? '#00e676' : '#76ff03');"
+      "fixEl.style.color = (d.f9p ? '#00e676' : '#ffea00');"
       "document.getElementById('s_pdop').innerText = d.pdop;"
       "document.getElementById('s_view').innerText = d.inView;"
       "document.getElementById('s_use').innerText = d.inUse;"
       "document.getElementById('s_ant').innerText = d.antStat;"
-      "document.getElementById('s_temp').innerText = d.temp + ' (' + d.uptime + ')';"
+      "document.getElementById('s_temp').innerText = d.temp + ' / ' + d.uptime;"
+      "document.getElementById('s_svin').innerText = d.svinText;"
       "document.getElementById('s_coords').innerText = d.liveCoords;"
       "document.getElementById('s_rovers').innerText = d.rovers+' шт.';"
       "document.getElementById('s_bytes').innerText = d.bytes+' байт';"
       "document.getElementById('s_net').innerText = d.net;"
+      "let avg = d.avgSnr || 0;"
+      "document.getElementById('snr_val').innerText = avg.toFixed(1);"
+      "document.getElementById('snr_pin').style.left = Math.min(Math.max(avg, 5), 95) + '%';"
       "let bw = document.getElementById('bars');"
       "if(!d.sats || d.sats.length === 0){"
-      "bw.innerHTML = '<div style=\"margin:auto;color:#6c7593;font-size:13px;\">Симулятор готов, ожидание спутников...</div>';"
+      "bw.innerHTML = '<div style=\"margin:auto;color:#6c7593;font-size:13px;\">Ожидание спутников...</div>';"
       "}else{"
       "let h = '';"
       "d.sats.forEach(s=>{"
-      "let px = Math.min(Math.max(s.cno * 2.2, 6), 115);"
+      "let px = Math.min(Math.max(s.cno * 2.2, 6), 110);"
       "let col = barColor(s.cno);"
       "let dot = s.used ? '#00e676' : '#555';"
       "h += '<div class=\"bar-col\"><div class=\"bar-val\">'+s.cno+'</div>'"
@@ -583,19 +594,22 @@ void setupWebMonitor() {
       "<div class='stat-box'><div class='stat-title'>Статус GNSS</div><div id='s_fix' class='stat-val' style='font-size:14px;'>Загрузка...</div></div>"
       "<div class='stat-box'><div class='stat-title'>PDOP (Геометрия)</div><div id='s_pdop' class='stat-val' style='color:#00e5ff;'>-</div></div>"
       "<div class='stat-box'><div class='stat-title'>Антенна (ANT-B10)</div><div id='s_ant' class='stat-val' style='font-size:15px;color:#76ff03;'>-</div></div>"
-      "<div class='stat-box'><div class='stat-title'>CPU / Uptime</div><div id='s_temp' class='stat-val' style='font-size:13px;color:#ffea00;'>-</div></div>"
+      "<div class='stat-box'><div class='stat-title'>CPU / Uptime</div><div id='s_temp' class='stat-val' style='font-size:14px;color:#ffea00;'>-</div></div>"
       "</div>"
 
       "<div class='sky-panel'>"
       "<div class='sky-counts'>"
-      "<div><div class='stat-title'>В поле зрения: <b id='s_view'>0</b></div></div>"
-      "<div style='text-align:right;'><div class='stat-title'>В использовании: <b id='s_use' style='color:#76ff03;'>0</b></div></div>"
+      "<div><div class='stat-title'>В поле зрения: <b id='s_view' style='color:#fff;font-size:16px;'>0</b></div></div>"
+      "<div style='text-align:right;'><div class='stat-title'>В использовании: <b id='s_use' style='color:#76ff03;font-size:16px;'>0</b></div></div>"
       "</div>"
-      "<canvas id='skyplot' width='220' height='220' style='margin:8px auto;display:block;'></canvas>"
-      "<div style='font-size:11px;color:#9aa0a6;margin-top:4px;'>Уровни сигнала SNR (C/N0):</div>"
+      "<canvas id='skyplot' width='210' height='210' style='margin:4px auto;display:block;'></canvas>"
       "<div id='bars' class='bars-wrap'></div>"
+      "<div style='margin-top:10px;font-size:11px;color:#9aa0a6;'>AVG SNR (Средний уровень сигнала, dBHz):</div>"
+      "<div class='snr-bar'><div id='snr_pin' class='snr-pin' style='left:30%;'><span id='snr_val'>0.0</span></div></div>"
       "</div>"
 
+      "<div class='row'><span>Активный режим:</span><b>" + String(useFixedBase ? "FIXED (Постоянный)" : "SURVEY-IN (Авто)") + "</b></div>"
+      "<div class='row'><span>Survey-In:</span><b id='s_svin'>-</b></div>"
       "<div class='row'><span>Текущие WGS-84:</span><b id='s_coords'>-</b></div>"
       "<div class='row'><span>Роверов (Порт " + String(LOCAL_NTRIP_PORT) + "):</span><b id='s_rovers'>0 шт.</b></div>"
       "<div class='row'><span>Поток RTCM3 (5с):</span><b id='s_bytes'>0 байт</b></div>"
@@ -609,6 +623,11 @@ void setupWebMonitor() {
       "<button type='button' class='btn btn-preset' onclick='setPreset(52.1480380,26.1744910,146.0)'>🏡 Высокое</button>"
       "</div>"
       "<form action='/save_gnss' method='POST'>"
+      "<label>Режим запуска базы:</label>"
+      "<select name='mode'>"
+      "<option value='0'" + String(!useFixedBase ? " selected" : "") + ">Survey-In (Автоусреднение на месте)</option>"
+      "<option value='1'" + String(useFixedBase ? " selected" : "") + ">Fixed Mode (Жесткие координаты)</option>"
+      "</select>"
       "<label>Широта WGS-84 (град):</label>"
       "<input id='lat' type='number' step='0.00000001' name='lat' value='" + String(fixedLatDeg, 8) + "' required>"
       "<label>Долгота WGS-84 (град):</label>"
@@ -617,7 +636,15 @@ void setupWebMonitor() {
       "<input id='hgt' type='number' step='0.0001' name='hgt' value='" + String(fixedHeightM, 4) + "' required>"
       "<label>Поправка фазового центра ARP ➔ APC (м):</label>"
       "<input type='number' step='0.001' name='ant_off' value='" + String(antennaHOffset, 3) + "' required>"
-      "<button type='submit' class='btn btn-save'>💾 Применить координаты и поправку антенны</button>"
+      "<label>Время Survey-In (сек) / Допуск (м):</label>"
+      "<div style='display:flex;gap:8px;'>"
+      "<input type='number' name='dur' value='" + String(svinMinDur) + "' required>"
+      "<input type='number' step='0.01' name='acc' value='" + String(svinAccLimitM, 2) + "' required>"
+      "</div>"
+      "<button type='submit' class='btn btn-save'>💾 Применить координаты и поправку</button>"
+      "</form>"
+      "<form action='/use_current' method='POST'>"
+      "<button type='submit' class='btn btn-copy'>🎯 Зафиксировать текущие с неба в FIXED</button>"
       "</form>"
       "</div>"
 
@@ -628,6 +655,21 @@ void setupWebMonitor() {
       "<input type='text' name='w_ssid' value='" + wifiSsid + "'>"
       "<label>Пароль Wi-Fi:</label>"
       "<input type='password' name='w_pass' value='" + wifiPass + "'>"
+      "<label>Дублировать поток во внешний NTRIP Caster:</label>"
+      "<select name='c_en'>"
+      "<option value='0'" + String(!cloudEnabled ? " selected" : "") + ">Выкл (Только прямой сервер 192.168.0.200:2101)</option>"
+      "<option value='1'" + String(cloudEnabled ? " selected" : "") + ">Вкл (Отправлять на Emlid / свой сервер)</option>"
+      "</select>"
+      "<label>Хост / Порт кастера:</label>"
+      "<div style='display:flex;gap:8px;'>"
+      "<input type='text' name='c_host' value='" + casterHost + "'>"
+      "<input type='number' name='c_port' value='" + String(casterPort) + "' style='width:35%;'>"
+      "</div>"
+      "<label>Точка монтирования / Пароль кастера:</label>"
+      "<div style='display:flex;gap:8px;'>"
+      "<input type='text' name='c_mnt' value='" + casterMount + "'>"
+      "<input type='password' name='c_pass' value='" + casterPass + "'>"
+      "</div>"
       "<button type='submit' class='btn btn-save'>🔄 Сохранить сеть и перезагрузить</button>"
       "</form>"
       "<a href='/update' class='btn btn-refresh' style='margin-top:14px;font-size:13px;'>📦 Веб-обновление прошивки (.bin)</a>"
@@ -637,11 +679,13 @@ void setupWebMonitor() {
   });
 
   webServer.on("/save_gnss", HTTP_POST, []() {
-    useFixedBase = true;
+    if (webServer.hasArg("mode"))    useFixedBase   = (webServer.arg("mode").toInt() == 1);
     if (webServer.hasArg("lat"))     fixedLatDeg    = webServer.arg("lat").toDouble();
     if (webServer.hasArg("lon"))     fixedLonDeg    = webServer.arg("lon").toDouble();
     if (webServer.hasArg("hgt"))     fixedHeightM   = webServer.arg("hgt").toDouble();
     if (webServer.hasArg("ant_off")) antennaHOffset = webServer.arg("ant_off").toDouble();
+    if (webServer.hasArg("dur"))     svinMinDur     = webServer.arg("dur").toInt();
+    if (webServer.hasArg("acc"))     svinAccLimitM  = webServer.arg("acc").toFloat();
 
     saveSettings();
     applyBaseModeToF9P();
@@ -649,9 +693,29 @@ void setupWebMonitor() {
     webServer.send(303);
   });
 
+  webServer.on("/use_current", HTTP_POST, []() {
+    if (liveLatDeg != 0.0 && liveLonDeg != 0.0) {
+      fixedLatDeg = liveLatDeg;
+      fixedLonDeg = liveLonDeg;
+      fixedHeightM = liveHeightM;
+      antennaHOffset = 0.0; // Координата с неба уже принадлежит фазовому центру APC
+      useFixedBase = true;
+      saveSettings();
+      applyBaseModeToF9P();
+    }
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  });
+
   webServer.on("/save_net", HTTP_POST, []() {
-    if (webServer.hasArg("w_ssid")) wifiSsid = webServer.arg("w_ssid");
-    if (webServer.hasArg("w_pass")) wifiPass = webServer.arg("w_pass");
+    if (webServer.hasArg("w_ssid")) wifiSsid     = webServer.arg("w_ssid");
+    if (webServer.hasArg("w_pass")) wifiPass     = webServer.arg("w_pass");
+    if (webServer.hasArg("c_en"))   cloudEnabled = (webServer.arg("c_en").toInt() == 1);
+    if (webServer.hasArg("c_host")) casterHost   = webServer.arg("c_host");
+    if (webServer.hasArg("c_port")) casterPort   = webServer.arg("c_port").toInt();
+    if (webServer.hasArg("c_mnt"))  casterMount  = webServer.arg("c_mnt");
+    if (webServer.hasArg("c_pass")) casterPass   = webServer.arg("c_pass");
+
     saveSettings();
     webServer.send(200, "text/html", "<meta charset='utf-8'><h3>Настройки сохранены! Перезагрузка...</h3>");
     delay(800);
@@ -762,6 +826,25 @@ bool configureF9PBase() {
   return false;
 }
 
+bool connectCloudCaster() {
+  if (!cloudEnabled || isApMode || cloudCasterClient.connected()) return true;
+  if (!cloudCasterClient.connect(casterHost.c_str(), casterPort)) return false;
+
+  String authHeader = "SOURCE " + casterPass + " /" + casterMount + "\r\n" +
+                      "Source-Agent: NTRIP ESP32-S3-F9P-Base/" FW_VERSION "\r\n\r\n";
+  cloudCasterClient.print(authHeader);
+
+  unsigned long timeout = millis();
+  while (cloudCasterClient.available() == 0) {
+    if (millis() - timeout > 4000) { cloudCasterClient.stop(); return false; }
+    delay(10);
+  }
+  String resp = cloudCasterClient.readStringUntil('\n');
+  if (resp.indexOf("200 OK") != -1) return true;
+  cloudCasterClient.stop();
+  return false;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -773,6 +856,7 @@ void setup() {
 
 void loop() {
   static uint32_t lastReportTime = 0;
+  static uint32_t lastReconnectAttempt = 0;
   static uint32_t lastF9PCheck = 0;
 
   ArduinoOTA.handle();
@@ -782,11 +866,20 @@ void loop() {
   if (f9pConnected) {
     processUARTStream();
   } else {
-    // Демо-режим, пока ZED-F9P не подключен
     runDemoSimulator();
-    if (millis() - lastF9PCheck > 5000) {
+    if (millis() - lastF9PCheck > 10000) {
       lastF9PCheck = millis();
       configureF9PBase();
+    }
+  }
+
+  if (millis() - lastReconnectAttempt > 5000) {
+    lastReconnectAttempt = millis();
+    if (!isApMode && WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+    }
+    if (cloudEnabled && !isApMode && WiFi.status() == WL_CONNECTED && !cloudCasterClient.connected()) {
+      connectCloudCaster();
     }
   }
 
