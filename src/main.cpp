@@ -9,7 +9,7 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.5.1"
+#define FW_VERSION "1.5.2"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
@@ -57,7 +57,7 @@ uint32_t svinObsTime = 0;
 float svinMeanAcc = 0.0;
 bool f9pConnected = false;
 
-// === Параметры монитора ВЧ-помех и антенны (UBX-MON-RF) ===
+// === Параметры монитора ВЧ-помех и антенны (прямой парсер UBX-MON-RF 0x0A 0x38) ===
 uint8_t jammerState = 0;     // 0/1 = OK, 2 = Warning, 3 = Critical Jamming
 uint16_t noisePer   = 0;     // Уровень шума приемника
 String antennaStatus = "OK"; // OK, OPEN, SHORT
@@ -179,7 +179,7 @@ bool applyBaseModeToF9P() {
   return myGNSS.sendCfgValset();
 }
 
-// 3. Колбэки телеметрии ZED-F9P (PVT, SVIN, NAV-SAT и MON-RF)
+// 3. Колбэки телеметрии ZED-F9P (PVT, SVIN и NAV-SAT)
 void onPVTData(UBX_NAV_PVT_data_t *pvt) {
   if (pvt == nullptr) return;
   currentSIV = pvt->numSV;
@@ -250,19 +250,48 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
   avgSnr     = (snrCount > 0) ? ((float)snrSum / snrCount) : 0.0f;
 }
 
-void onMONRFData(UBX_MON_RF_data_t *rf) {
-  if (rf == nullptr || rf->header.nBlocks == 0) return;
+// Прямой аппаратный разбор пакета UBX-MON-RF (Class 0x0A, ID 0x38) без зависимости от версии библиотеки
+void parseRawUBXByte(uint8_t b) {
+  static uint8_t ubxState = 0;
+  static uint8_t msgClass = 0, msgId = 0;
+  static uint16_t msgLen = 0, payIdx = 0;
+  static uint8_t rfPayload[64];
 
-  // ИСПРАВЛЕНО: обращаемся к массиву blocks[0]
-  noisePer = rf->blocks[0].noisePerMS;
-  jammerState = rf->blocks[0].flags.bits.jammingState;
+  switch (ubxState) {
+    case 0: if (b == 0xB5) ubxState = 1; break;
+    case 1: ubxState = (b == 0x62) ? 2 : 0; break;
+    case 2: msgClass = b; ubxState = 3; break;
+    case 3: msgId = b; ubxState = 4; break;
+    case 4: msgLen = b; ubxState = 5; break;
+    case 5:
+      msgLen |= ((uint16_t)b << 8);
+      payIdx = 0;
+      if (msgClass == 0x0A && msgId == 0x38 && msgLen >= 28 && msgLen <= sizeof(rfPayload)) {
+        ubxState = 6; // Читаем тело пакета UBX-MON-RF
+      } else {
+        ubxState = 0;
+      }
+      break;
+    case 6:
+      rfPayload[payIdx++] = b;
+      if (payIdx >= msgLen) {
+        uint8_t nBlocks = rfPayload[1];
+        if (nBlocks > 0) {
+          // Смещения внутри первого RF-блока (начинается с байта 4 полезной нагрузки):
+          uint8_t flags   = rfPayload[4 + 1];
+          uint8_t antStat = rfPayload[4 + 2];
+          noisePer        = (uint16_t)rfPayload[4 + 16] | ((uint16_t)rfPayload[4 + 17] << 8);
+          jammerState     = flags & 0x03;
 
-  uint8_t antStat = rf->blocks[0].antStatus;
-  if (antStat == 1) antennaStatus = "DONTKNOW";
-  else if (antStat == 2) antennaStatus = "OK";
-  else if (antStat == 3) antennaStatus = "SHORT (КЗ)";
-  else if (antStat == 4) antennaStatus = "OPEN (Обрыв)";
-  else antennaStatus = "OK";
+          if (antStat == 2) antennaStatus = "OK";
+          else if (antStat == 3) antennaStatus = "SHORT (КЗ)";
+          else if (antStat == 4) antennaStatus = "OPEN (Обрыв)";
+          else antennaStatus = "OK";
+        }
+        ubxState = 0;
+      }
+      break;
+  }
 }
 
 // 4. Двухпоточный демультиплексор UART2 (RTCM3 + UBX)
@@ -281,12 +310,14 @@ void processUARTStream() {
         rtcmIdx = 0;
         rtcmBuf[rtcmIdx++] = b;
       } else {
+        parseRawUBXByte(b);
         myGNSS.pushRawData(&b, 1);
       }
     } else {
       rtcmBuf[rtcmIdx++] = b;
       if (rtcmIdx == 3) {
         if ((rtcmBuf[1] & 0xFC) != 0x00) {
+          for (int k = 0; k < 3; k++) parseRawUBXByte(rtcmBuf[k]);
           myGNSS.pushRawData(rtcmBuf, 3);
           inRtcmFrame = false;
           rtcmIdx = 0;
@@ -375,7 +406,7 @@ void initNetwork() {
   ArduinoOTA.begin();
 }
 
-// 6. Веб-интерфейс v1.5.1 (с мониторингом помех и антенны)
+// 6. Веб-интерфейс v1.5.2 (с мониторингом помех и антенны)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
@@ -738,7 +769,6 @@ bool configureF9PBase() {
     myGNSS.setAutoPVTcallbackPtr(&onPVTData);
     myGNSS.setAutoNAVSVINcallbackPtr(&onSVINData);
     myGNSS.setAutoNAVSATcallbackPtr(&onSATData);
-    myGNSS.setAutoMONRF2callbackPtr(&onMONRFData); // ИСПРАВЛЕНО для v3.1.15
     return applyBaseModeToF9P();
   }
   return false;
