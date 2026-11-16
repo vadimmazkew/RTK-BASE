@@ -9,7 +9,7 @@
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.6.1"
+#define FW_VERSION "1.7.0"
 #define RXD2 16  // К пину TX1 платы ZED-F9P (URTK1.2)
 #define TXD2 17  // К пину RX1 платы ZED-F9P (URTK1.2)
 #define MAX_LOCAL_CLIENTS 3
@@ -35,10 +35,11 @@ String casterMount  = MOUNTPOINT;
 String casterPass   = SOURCE_PASSWORD;
 
 bool useFixedBase   = false;
+bool balconyFilter  = true;           // true = Фильтр переотражений для балкона (15 град / 22 dBHz)
 double fixedLatDeg  = 52.1115330;     // Пинск
 double fixedLonDeg  = 26.1004610;
 double fixedHeightM = 145.000;        // Базовая высота эллипсоида
-double antennaHOffset = 0.045;        // Поправка фазового центра ARP -> APC (45 мм)
+double antennaHOffset = 0.045;        // Поправка фазового центра ARP -> APC (45 мм для ANT-B10)
 uint32_t svinMinDur = 300;
 float svinAccLimitM = 2.00;
 
@@ -48,7 +49,9 @@ volatile uint32_t rtcmBytesGenerated = 0;
 uint32_t last5SecBytes = 0;
 uint8_t currentSIV = 0;
 uint8_t currentFixType = 0;
-float currentPDOP = 1.2f;
+float currentPDOP = 1.1f;
+float currentHAccMM = 12.0f;          // Горизонтальная оценка точности (мм)
+float currentVAccMM = 18.0f;          // Вертикальная оценка точности (мм)
 double liveLatDeg = 52.1115330;
 double liveLonDeg = 26.1004610;
 double liveHeightM = 145.000;
@@ -57,6 +60,9 @@ bool svinValid = true;
 uint32_t svinObsTime = 300;
 float svinMeanAcc = 0.005f;
 bool f9pConnected = false;
+
+// === Счетчики пакетов RTCM3 (Инспектор потока) ===
+uint32_t cnt1005 = 0, cnt1077 = 0, cnt1087 = 0, cnt1097 = 0, cnt1127 = 0, cnt1230 = 0;
 
 // === Монитор ВЧ-помех и антенны ===
 uint16_t noisePer = 0;
@@ -68,8 +74,8 @@ struct SatInfo {
   char sysChar;
   uint8_t svId;
   uint8_t cno;
-  int8_t elev;       // Возвышение (0 - 90 град)
-  int16_t azim;      // Азимут (0 - 360 град)
+  int8_t elev;
+  int16_t azim;
   bool used;
 };
 
@@ -90,6 +96,7 @@ void loadSettings() {
   casterPass     = prefs.getString("c_pass", SOURCE_PASSWORD);
 
   useFixedBase   = prefs.getBool("fixed", false);
+  balconyFilter  = prefs.getBool("b_filt", true);
   fixedLatDeg    = prefs.getDouble("lat", 52.1115330);
   fixedLonDeg    = prefs.getDouble("lon", 26.1004610);
   fixedHeightM   = prefs.getDouble("hgt", 145.000);
@@ -115,6 +122,7 @@ void saveSettings() {
   prefs.putString("c_pass", casterPass);
 
   prefs.putBool("fixed", useFixedBase);
+  prefs.putBool("b_filt", balconyFilter);
   prefs.putDouble("lat", fixedLatDeg);
   prefs.putDouble("lon", fixedLonDeg);
   prefs.putDouble("hgt", fixedHeightM);
@@ -132,9 +140,22 @@ uint8_t getActiveRoverCount() {
   return count;
 }
 
+// Анализ заголовка кадра RTCM3 (12-битный номер сообщения)
+void inspectRtcmPacket(const uint8_t *buf, size_t len) {
+  if (len < 6) return;
+  uint16_t msgType = ((uint16_t)buf[3] << 4) | ((buf[4] >> 4) & 0x0F);
+  if (msgType == 1005 || msgType == 1006) cnt1005++;
+  else if (msgType == 1077) cnt1077++;
+  else if (msgType == 1087) cnt1087++;
+  else if (msgType == 1097) cnt1097++;
+  else if (msgType == 1127) cnt1127++;
+  else if (msgType == 1230) cnt1230++;
+}
+
 void broadcastRTCM(const uint8_t *data, size_t len) {
   if (len == 0) return;
   rtcmBytesGenerated += len;
+  inspectRtcmPacket(data, len);
 
   for (int i = 0; i < MAX_LOCAL_CLIENTS; i++) {
     if (localRoverClients[i] && localRoverClients[i].connected()) {
@@ -146,11 +167,17 @@ void broadcastRTCM(const uint8_t *data, size_t len) {
   }
 }
 
-// 2. Применение геодезических координат с учетом высоты фазового центра
+// 2. Применение координат и фильтра многолучевости (Балкон / Крыша)
 bool applyBaseModeToF9P() {
   if (!f9pConnected) return false;
 
   myGNSS.newCfgValset(VAL_LAYER_RAM_BBR);
+
+  // Профиль фильтрации переотражений: Балкон (15 град / 22 dBHz) или Крыша (10 град / 15 dBHz)
+  uint8_t minElev = balconyFilter ? 15 : 10;
+  uint8_t minCno  = balconyFilter ? 22 : 15;
+  myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINELEV, minElev);
+  myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINCNO, minCno);
 
   if (useFixedBase) {
     double totalHeight = fixedHeightM + antennaHOffset;
@@ -191,6 +218,8 @@ void onPVTData(UBX_NAV_PVT_data_t *pvt) {
   currentSIV = pvt->numSV;
   currentFixType = pvt->fixType;
   currentPDOP = pvt->pDOP / 100.0f;
+  currentHAccMM = pvt->hAcc;
+  currentVAccMM = pvt->vAcc;
   liveLatDeg = pvt->lat / 1e7;
   liveLonDeg = pvt->lon / 1e7;
   liveHeightM = pvt->height / 1000.0;
@@ -259,14 +288,25 @@ void onSATData(UBX_NAV_SAT_data_t *sat) {
 
 // Демо-симулятор спутников (работает автоматически, пока ZED-F9P не подключен)
 void runDemoSimulator() {
+  static uint32_t lastSimTick = 0;
+  if (millis() - lastSimTick < 1000) return;
+  lastSimTick = millis();
+
   f9pConnected = false;
   currentFixType = 5;
   currentSIV = 36;
   satsInView = 42;
   satsInUse = 36;
   currentPDOP = 1.1f;
+  currentHAccMM = 8.5f;
+  currentVAccMM = 14.2f;
+
+  // Имитируем счетчики пакетов в демо-режиме
+  cnt1005++; cnt1077++; cnt1087++; cnt1097++; cnt1127++;
+  if ((cnt1077 % 5) == 0) cnt1230++;
 
   uint32_t snrSum = 0;
+  uint8_t minCno = balconyFilter ? 22 : 15;
   for (int i = 0; i < 28; i++) {
     char sys[4] = {'G', 'R', 'E', 'B'};
     satList[i].sysChar = sys[i % 4];
@@ -274,7 +314,7 @@ void runDemoSimulator() {
     satList[i].cno = 24 + (millis() / 2000 + i * 5) % 24;
     satList[i].elev = 15 + (i * 11) % 72;
     satList[i].azim = (i * 13 + (millis() / 10000)) % 360;
-    satList[i].used = (satList[i].cno >= 28);
+    satList[i].used = (satList[i].cno >= minCno);
     snrSum += satList[i].cno;
   }
   avgSnr = snrSum / 28.0f;
@@ -368,13 +408,16 @@ void processUARTStream() {
   myGNSS.checkCallbacks();
 }
 
-// 4. Инициализация сети (13 канал)
+// 4. Инициализация сети с отключением энергосбережения Wi-Fi (минимальный пинг и джиттер)
 void initNetwork() {
   WiFi.persistent(false);
   WiFi.disconnect(true);
   delay(100);
 
   WiFi.mode(WIFI_AP_STA);
+
+  // Отключаем засыпание Wi-Fi модуля для мгновенной отправки пакетов RTCM3 без задержек
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
   wifi_country_t country = {
     .cc = "BY",
@@ -421,28 +464,37 @@ void initNetwork() {
 
   MDNS.begin(OTA_HOSTNAME);
   localNtripServer.begin();
+  localNtripServer.setNoDelay(true); // Мгновенная отдача TCP-кадров без буферизации Нейгла
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.begin();
 }
 
-// 5. Веб-интерфейс v1.6.1 (Skyplot 360, AVG SNR, Температура ESP32-S3, Поправка высоты ARP->APC)
+// 5. Веб-интерфейс v1.7.0 (Ultra-Precision Edition)
 void setupWebMonitor() {
   httpUpdater.setup(&webServer, "/update", "admin", OTA_PASSWORD);
 
   webServer.on("/api/status", HTTP_GET, []() {
-    String fixText = !f9pConnected ? "DEMO (Ожидание ZED-F9P)" :
+    String fixText = !f9pConnected ? "DEMO (Симулятор)" :
                      (currentFixType == 5) ? "TIME (БАЗА АКТИВНА)" :
                      (currentFixType == 3) ? "3D Fix" : "Поиск неба";
     String svinText = svinValid ? "ГОТОВО" : (svinActive ? "Накопление..." : "Fixed Mode");
     String netInfo = isApMode ? ("AP: " + String(AP_SSID) + " (192.168.4.1)") :
                                 (wifiSsid + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)");
 
-    // ИСПРАВЛЕНО для ESP32-S3: нативная функция temperatureRead()
     float cpuTemp = temperatureRead();
     uint32_t uptimeSec = millis() / 1000;
     char uptimeStr[32];
     sprintf(uptimeStr, "%luч %02luм", uptimeSec / 3600, (uptimeSec % 3600) / 60);
+
+    // Расчет 3D-отклонения текущих координат от записанных Fixed (в миллиметрах)
+    double dLatM = (liveLatDeg - fixedLatDeg) * 111320.0;
+    double dLonM = (liveLonDeg - fixedLonDeg) * 111320.0 * cos(fixedLatDeg * DEG_TO_RAD);
+    double driftMM = sqrt(dLatM * dLatM + dLonM * dLonM) * 1000.0;
+    if (!f9pConnected) driftMM = 2.4;
+
+    String rtcmStat = "1005:" + String(cnt1005) + " | G:" + String(cnt1077) +
+                      " R:" + String(cnt1087) + " E:" + String(cnt1097) + " B:" + String(cnt1127);
 
     String json = "{";
     json += "\"f9p\":" + String(f9pConnected ? "true" : "false") + ",";
@@ -456,6 +508,8 @@ void setupWebMonitor() {
     json += "\"antStat\":\"" + antennaStatus + "\",";
     json += "\"temp\":\"" + String(cpuTemp, 1) + "°C\",";
     json += "\"uptime\":\"" + String(uptimeStr) + "\",";
+    json += "\"drift\":\"" + String(driftMM, 1) + " мм\",";
+    json += "\"rtcmStat\":\"" + rtcmStat + "\",";
     json += "\"svinText\":\"" + svinText + " (" + String(svinObsTime) + "с / " + String(svinMeanAcc, 2) + "м)\",";
     json += "\"liveCoords\":\"" + String(liveLatDeg, 7) + ", " + String(liveLonDeg, 7) + " (" + String(liveHeightM, 2) + "м)\",";
     json += "\"rovers\":" + String(getActiveRoverCount()) + ",";
@@ -552,13 +606,14 @@ void setupWebMonitor() {
       "let fixEl = document.getElementById('s_fix');"
       "fixEl.innerText = d.fixText;"
       "fixEl.style.color = (d.f9p ? '#00e676' : '#ffea00');"
-      "document.getElementById('s_pdop').innerText = d.pdop;"
+      "document.getElementById('s_pdop').innerText = d.pdop + ' (' + d.drift + ')';"
       "document.getElementById('s_view').innerText = d.inView;"
       "document.getElementById('s_use').innerText = d.inUse;"
       "document.getElementById('s_ant').innerText = d.antStat;"
       "document.getElementById('s_temp').innerText = d.temp + ' / ' + d.uptime;"
       "document.getElementById('s_svin').innerText = d.svinText;"
       "document.getElementById('s_coords').innerText = d.liveCoords;"
+      "document.getElementById('s_rtcm').innerText = d.rtcmStat;"
       "document.getElementById('s_rovers').innerText = d.rovers+' шт.';"
       "document.getElementById('s_bytes').innerText = d.bytes+' байт';"
       "document.getElementById('s_net').innerText = d.net;"
@@ -592,7 +647,7 @@ void setupWebMonitor() {
       "<h2>🛰️ RTK База v" FW_VERSION " (" + String(LOCAL_MOUNTPOINT) + ")</h2>"
       "<div class='top-grid'>"
       "<div class='stat-box'><div class='stat-title'>Статус GNSS</div><div id='s_fix' class='stat-val' style='font-size:14px;'>Загрузка...</div></div>"
-      "<div class='stat-box'><div class='stat-title'>PDOP (Геометрия)</div><div id='s_pdop' class='stat-val' style='color:#00e5ff;'>-</div></div>"
+      "<div class='stat-box'><div class='stat-title'>PDOP / Дрейф базы</div><div id='s_pdop' class='stat-val' style='font-size:15px;color:#00e5ff;'>-</div></div>"
       "<div class='stat-box'><div class='stat-title'>Антенна (ANT-B10)</div><div id='s_ant' class='stat-val' style='font-size:15px;color:#76ff03;'>-</div></div>"
       "<div class='stat-box'><div class='stat-title'>CPU / Uptime</div><div id='s_temp' class='stat-val' style='font-size:14px;color:#ffea00;'>-</div></div>"
       "</div>"
@@ -600,7 +655,7 @@ void setupWebMonitor() {
       "<div class='sky-panel'>"
       "<div class='sky-counts'>"
       "<div><div class='stat-title'>В поле зрения: <b id='s_view' style='color:#fff;font-size:16px;'>0</b></div></div>"
-      "<div style='text-align:right;'><div class='stat-title'>В использовании: <b id='s_use' style='color:#76ff03;font-size:16px;'>0</b></div></div>"
+      "<div style='text-align:right;'><div class='stat-title'>В решении RTK: <b id='s_use' style='color:#76ff03;font-size:16px;'>0</b></div></div>"
       "</div>"
       "<canvas id='skyplot' width='210' height='210' style='margin:4px auto;display:block;'></canvas>"
       "<div id='bars' class='bars-wrap'></div>"
@@ -608,16 +663,17 @@ void setupWebMonitor() {
       "<div class='snr-bar'><div id='snr_pin' class='snr-pin' style='left:30%;'><span id='snr_val'>0.0</span></div></div>"
       "</div>"
 
-      "<div class='row'><span>Активный режим:</span><b>" + String(useFixedBase ? "FIXED (Постоянный)" : "SURVEY-IN (Авто)") + "</b></div>"
+      "<div class='row'><span>Фильтр многолучевости:</span><b>" + String(balconyFilter ? "БАЛКОН (15° / 22 dBHz)" : "КРЫША (10° / 15 dBHz)") + "</b></div>"
       "<div class='row'><span>Survey-In:</span><b id='s_svin'>-</b></div>"
       "<div class='row'><span>Текущие WGS-84:</span><b id='s_coords'>-</b></div>"
+      "<div class='row'><span>Инспектор RTCM3:</span><b id='s_rtcm' style='font-size:11px;color:#80cbc4;'>-</b></div>"
       "<div class='row'><span>Роверов (Порт " + String(LOCAL_NTRIP_PORT) + "):</span><b id='s_rovers'>0 шт.</b></div>"
       "<div class='row'><span>Поток RTCM3 (5с):</span><b id='s_bytes'>0 байт</b></div>"
       "<div class='row'><span>Сеть:</span><b id='s_net' style='font-size:12px;'>" + WiFi.localIP().toString() + "</b></div>"
       "</div>"
 
       "<div class='card'>"
-      "<h3>⚙️ Координаты и фазовый центр антенны</h3>"
+      "<h3>⚙️ Координаты, фильтр неба и фазовый центр</h3>"
       "<div style='display:flex;justify-content:space-between;'>"
       "<button type='button' class='btn btn-preset' onclick='setPreset(52.1115330,26.1004610,145.0)'>📍 Пинск</button>"
       "<button type='button' class='btn btn-preset' onclick='setPreset(52.1480380,26.1744910,146.0)'>🏡 Высокое</button>"
@@ -627,6 +683,11 @@ void setupWebMonitor() {
       "<select name='mode'>"
       "<option value='0'" + String(!useFixedBase ? " selected" : "") + ">Survey-In (Автоусреднение на месте)</option>"
       "<option value='1'" + String(useFixedBase ? " selected" : "") + ">Fixed Mode (Жесткие координаты)</option>"
+      "</select>"
+      "<label>Подавление переотражений (Multipath Filter):</label>"
+      "<select name='b_filt'>"
+      "<option value='1'" + String(balconyFilter ? " selected" : "") + ">Балкон / Застройка (Срез 15°, порог 22 dBHz)</option>"
+      "<option value='0'" + String(!balconyFilter ? " selected" : "") + ">Крыша / Поле (Срез 10°, порог 15 dBHz)</option>"
       "</select>"
       "<label>Широта WGS-84 (град):</label>"
       "<input id='lat' type='number' step='0.00000001' name='lat' value='" + String(fixedLatDeg, 8) + "' required>"
@@ -641,7 +702,7 @@ void setupWebMonitor() {
       "<input type='number' name='dur' value='" + String(svinMinDur) + "' required>"
       "<input type='number' step='0.01' name='acc' value='" + String(svinAccLimitM, 2) + "' required>"
       "</div>"
-      "<button type='submit' class='btn btn-save'>💾 Применить координаты и поправку</button>"
+      "<button type='submit' class='btn btn-save'>💾 Применить настройки в ZED-F9P</button>"
       "</form>"
       "<form action='/use_current' method='POST'>"
       "<button type='submit' class='btn btn-copy'>🎯 Зафиксировать текущие с неба в FIXED</button>"
@@ -680,6 +741,7 @@ void setupWebMonitor() {
 
   webServer.on("/save_gnss", HTTP_POST, []() {
     if (webServer.hasArg("mode"))    useFixedBase   = (webServer.arg("mode").toInt() == 1);
+    if (webServer.hasArg("b_filt"))  balconyFilter  = (webServer.arg("b_filt").toInt() == 1);
     if (webServer.hasArg("lat"))     fixedLatDeg    = webServer.arg("lat").toDouble();
     if (webServer.hasArg("lon"))     fixedLonDeg    = webServer.arg("lon").toDouble();
     if (webServer.hasArg("hgt"))     fixedHeightM   = webServer.arg("hgt").toDouble();
@@ -698,7 +760,7 @@ void setupWebMonitor() {
       fixedLatDeg = liveLatDeg;
       fixedLonDeg = liveLonDeg;
       fixedHeightM = liveHeightM;
-      antennaHOffset = 0.0; // Координата с неба уже принадлежит фазовому центру APC
+      antennaHOffset = 0.0;
       useFixedBase = true;
       saveSettings();
       applyBaseModeToF9P();
@@ -730,6 +792,7 @@ void handleLocalNtripClients() {
 
   WiFiClient newClient = localNtripServer.accept();
   if (!newClient) return;
+  newClient.setNoDelay(true); // Отключаем задержку TCP для минимального Age of Differential
 
   unsigned long timeout = millis();
   while (!newClient.available() && millis() - timeout < 1500) delay(5);
@@ -743,7 +806,7 @@ void handleLocalNtripClients() {
   if (request.startsWith("GET / ") || request.startsWith("GET / HTTP")) {
     String sourceTable = 
       "SOURCETABLE 200 OK\r\nContent-Type: text/plain\r\n\r\n"
-      "STR;" + String(LOCAL_MOUNTPOINT) + ";Pinsk;RTCM 3.3;1005(1),1006(5),1077(1),1087(1),1097(1),1127(1),1230(5);2;GPS+GLO+GAL+BDS;LOCAL;BLR;" +
+      "STR;" + String(LOCAL_MOUNTPOINT) + ";Pinsk;RTCM 3.3;1005(1),1006(5),1033(10),1077(1),1087(1),1097(1),1127(1),1230(5);2;GPS+GLO+GAL+BDS;LOCAL;BLR;" +
       String(fixedLatDeg, 2) + ";" + String(fixedLonDeg, 2) + ";0;0;ESP32-F9P;none;N;N;9600;\r\nENDSOURCETABLE\r\n";
     newClient.print(sourceTable);
     delay(50);
@@ -755,6 +818,7 @@ void handleLocalNtripClients() {
     if (!localRoverClients[i] || !localRoverClients[i].connected()) {
       if (request.length() > 0) newClient.print("ICY 200 OK\r\n\r\n");
       localRoverClients[i] = newClient;
+      localRoverClients[i].setNoDelay(true);
       return;
     }
   }
@@ -762,7 +826,7 @@ void handleLocalNtripClients() {
 }
 
 bool configureF9PBase() {
-  RTKSerial.setRxBufferSize(4096);
+  RTKSerial.setRxBufferSize(8192); // Увеличенный аппаратный буфер DMA (8 КБ)
   RTKSerial.begin(460800, SERIAL_8N1, RXD2, TXD2);
 
   if (!myGNSS.begin(RTKSerial)) {
@@ -795,9 +859,10 @@ bool configureF9PBase() {
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_SBAS_ENA, 0);
   myGNSS.addCfgValset(UBLOX_CFG_SIGNAL_QZSS_ENA, 0);
 
+  // Стационарная геодезическая модель (2 = Stationary) и профиль среза многолучевости
   myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_DYNMODEL, 2);
-  myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINELEV, 10);
-  myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINCNO, 15);
+  myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINELEV, (uint8_t)(balconyFilter ? 15 : 10));
+  myGNSS.addCfgValset(UBLOX_CFG_NAVSPG_INFIL_MINCNO, (uint8_t)(balconyFilter ? 22 : 15));
   myGNSS.addCfgValset(UBLOX_CFG_RATE_MEAS, 1000);
 
   myGNSS.addCfgValset(UBLOX_CFG_UART1OUTPROT_NMEA, 0);
@@ -806,6 +871,9 @@ bool configureF9PBase() {
 
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1005_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1006_UART1, 5);
+  // Прямая бинарная инъекция ключа RTCM 1033 (Receiver & Antenna Description на UART1 = 0x20910319)
+  myGNSS.addCfgValset((uint32_t)0x20910319, (uint8_t)10);
+
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1077_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1087_UART1, 1);
   myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_RTCM_3X_TYPE1097_UART1, 1);
@@ -829,6 +897,7 @@ bool configureF9PBase() {
 bool connectCloudCaster() {
   if (!cloudEnabled || isApMode || cloudCasterClient.connected()) return true;
   if (!cloudCasterClient.connect(casterHost.c_str(), casterPort)) return false;
+  cloudCasterClient.setNoDelay(true);
 
   String authHeader = "SOURCE " + casterPass + " /" + casterMount + "\r\n" +
                       "Source-Agent: NTRIP ESP32-S3-F9P-Base/" FW_VERSION "\r\n\r\n";
